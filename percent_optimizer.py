@@ -46,6 +46,17 @@ class PercentLossConfig:
     # Diversity (repulsion) loss
     diversity_sigma: float = 0.03
 
+    # Device selection: "auto", "cpu", or "cuda"
+    device: str = "auto"
+
+
+def _get_device(config: PercentLossConfig) -> "torch.device":
+    if config.device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if config.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available. Check PyTorch CUDA install.")
+    return torch.device(config.device)
+
 
 def _require_torch() -> None:
     if torch is None:
@@ -223,7 +234,7 @@ def optimize_audience_percent(
     _require_torch()
 
     n = len(judge_percents)
-    device = torch.device("cpu")
+    device = _get_device(config)
 
     judge_p = torch.tensor(judge_percents, dtype=torch.float32, device=device)
     elim_mask = torch.tensor(eliminated_mask, dtype=torch.bool, device=device)
@@ -375,7 +386,7 @@ def optimize_audience_percent_ranges_loss_bounded(
     if n == 0:
         return np.array([]), np.array([]), 0.0
 
-    device = torch.device("cpu")
+    device = _get_device(config)
     judge_p = torch.tensor(judge_percents, dtype=torch.float32, device=device)
     elim_mask = torch.tensor(eliminated_mask, dtype=torch.bool, device=device)
     safe_mask_t = torch.tensor(safe_mask, dtype=torch.bool, device=device)
