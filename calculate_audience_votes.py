@@ -3,6 +3,7 @@ import numpy as np
 from scipy.optimize import linprog
 import warnings
 import re
+import os
 
 from percent_optimizer import PercentLossConfig, optimize_audience_percent
 
@@ -15,7 +16,7 @@ OUTPUT_FILE = '/Users/a1234/Desktop/美赛/MCM_Problem_C_Results.csv'
 PERCENT_LOSS_CONFIG = PercentLossConfig(
     alpha_constraint=80.0,  # large penalty for violating elimination constraints
     beta_smooth=2.0,
-    gamma_corr=1.0,
+    gamma_corr=10.0,
     delta_reg=0.6,
     steps=700,
     lr=0.06,
@@ -28,21 +29,56 @@ PERCENT_LOSS_CONFIG = PercentLossConfig(
     constraint_margin=0.0,
 )
 
-def parse_result_status(df):
+def build_week_cols_map(score_cols):
+    week_cols_map = {}
+    for c in score_cols:
+        try:
+            week_num = int(c.split('_')[0].replace('week', ''))
+        except Exception:
+            continue
+        week_cols_map.setdefault(week_num, []).append(c)
+    return week_cols_map
+
+def get_last_scored_week(row, week_cols_map):
+    last_week = None
+    for week_num in sorted(week_cols_map.keys()):
+        week_scores = []
+        for c in week_cols_map[week_num]:
+            val = row.get(c)
+            try:
+                val = float(val)
+                if not pd.isna(val) and val > 0:
+                    week_scores.append(val)
+            except Exception:
+                continue
+        if week_scores:
+            last_week = week_num
+    return last_week
+
+def parse_result_status(df, score_cols):
     """
     Parse 'results' column to determine Exit Week for each participant.
     """
     # Initialize ExitWeek with a large number (Survived)
     df['ExitWeek'] = 999 
     df['Status'] = 'Safe'
+    df['ElimRank'] = None
+    week_cols_map = build_week_cols_map(score_cols)
     
     for idx, row in df.iterrows():
         res = str(row['results']).lower()
+        placement_raw = row.get('placement')
+        try:
+            placement = int(float(placement_raw)) if placement_raw is not None and str(placement_raw).strip() != "" else None
+        except Exception:
+            placement = None
         if 'eliminated week' in res:
             try:
                 week = int(re.search(r'week (\d+)', res).group(1))
                 df.at[idx, 'ExitWeek'] = week
                 df.at[idx, 'Status'] = 'Eliminated'
+                if placement is not None:
+                    df.at[idx, 'ElimRank'] = placement
             except:
                 pass
         elif 'withdrew' in res:
@@ -52,8 +88,16 @@ def parse_result_status(df):
             df.at[idx, 'Status'] = 'Withdrew' 
             # We'll set ExitWeek dynamically based on missing scores.
         elif 'place' in res:
-            # Finalist
-            pass
+            # Finalist: use placement to determine elimination in final week
+            last_week = get_last_scored_week(row, week_cols_map)
+            if last_week is not None:
+                df.at[idx, 'ExitWeek'] = last_week
+            if placement == 1:
+                df.at[idx, 'Status'] = 'Winner'
+            else:
+                df.at[idx, 'Status'] = 'Eliminated'
+                if placement is not None:
+                    df.at[idx, 'ElimRank'] = placement
             
     return df
 
@@ -86,7 +130,9 @@ def get_weekly_participants(df, season, week, score_cols):
                 'total_score': total_score,
                 'status': row['Status'],
                 'exit_week': row['ExitWeek'],
-                'actual_result': row['results']
+                'actual_result': row['results'],
+                'placement': row.get('placement'),
+                'elim_rank': row.get('ElimRank')
             }
             
             # Determine outcome for THIS week
@@ -327,17 +373,38 @@ def solve_percent_rule_inverse(target_p, participants):
         
     return max(0.0, min_val), min(100.0, max_val)
 
-def main():
+def main(is_ml=True):
     print(f"Loading data from {INPUT_FILE}...")
     df = pd.read_csv(INPUT_FILE)
-    df = parse_result_status(df)
-    
     score_cols = [c for c in df.columns if 'judge' in c and 'score' in c and 'week' in c]
+    df = parse_result_status(df, score_cols)
     seasons = sorted(df['season'].unique())
     
     results = []
     global sorted_weeks # Hack for global access in get_participants
     
+    # Load prior ML outputs if needed
+    prev_ml_map = {}
+    if not is_ml:
+        if os.path.exists(OUTPUT_FILE):
+            try:
+                prev_df = pd.read_csv(OUTPUT_FILE)
+                for _, row in prev_df.iterrows():
+                    key = (row.get('CelebrityName'), int(row.get('Season')), int(row.get('Week')), row.get('RuleType'))
+                    prev_ml_map[key] = {
+                        'Predicted_Audience_Percent': row.get('Predicted_Audience_Percent'),
+                        'Predicted_Audience_Rank': row.get('Predicted_Audience_Rank'),
+                        'Loss_Total': row.get('Loss_Total'),
+                        'Loss_Constraint': row.get('Loss_Constraint'),
+                        'Loss_Smooth': row.get('Loss_Smooth'),
+                        'Loss_Corr': row.get('Loss_Corr'),
+                        'Loss_Reg': row.get('Loss_Reg'),
+                    }
+            except Exception as e:
+                print(f"Warning: failed to read previous ML output from {OUTPUT_FILE}: {e}")
+        else:
+            print(f"Warning: OUTPUT_FILE not found at {OUTPUT_FILE}; ML fields will be empty.")
+
     for season in seasons:
         # Determine Rule Type
         rule_type = 'Percent'
@@ -367,7 +434,7 @@ def main():
             week_aud_pcts = None
             week_aud_ranks = None
             week_loss = None
-            if rule_type == 'Percent':
+            if rule_type == 'Percent' and is_ml:
                 total_J = sum(p['total_score'] for p in participants)
                 judge_percents = [
                     (p['total_score'] / total_J) if total_J > 0 else 0.0
@@ -444,7 +511,7 @@ def main():
                     j_norm = f"{j_p:.1f}%"
 
                     # Predicted audience percent/rank from backprop optimization
-                    if week_aud_pcts is not None:
+                    if is_ml and week_aud_pcts is not None:
                         pred_aud_pct = float(week_aud_pcts[idx_p] * 100.0)
                         pred_aud_rank = int(round(week_aud_ranks[idx_p]))
                         if week_loss is not None:
@@ -453,7 +520,27 @@ def main():
                             loss_smooth = float(week_loss['smooth'])
                             loss_corr = float(week_loss['corr'])
                             loss_reg = float(week_loss['reg'])
+                    elif not is_ml:
+                        key = (p['name'], int(season), int(week), rule_type)
+                        cached = prev_ml_map.get(key)
+                        if cached:
+                            pred_aud_pct = cached.get('Predicted_Audience_Percent')
+                            pred_aud_rank = cached.get('Predicted_Audience_Rank')
+                            loss_total = cached.get('Loss_Total')
+                            loss_constraint = cached.get('Loss_Constraint')
+                            loss_smooth = cached.get('Loss_Smooth')
+                            loss_corr = cached.get('Loss_Corr')
+                            loss_reg = cached.get('Loss_Reg')
                 
+                status_out = 'Safe'
+                if p['status'] == 'Withdrew':
+                    status_out = 'Withdrew'
+                elif p['is_eliminated_this_week']:
+                    if p.get('elim_rank') is not None:
+                        status_out = f"Eliminated (Place {int(p['elim_rank'])})"
+                    else:
+                        status_out = 'Eliminated'
+
                 results.append({
                     'CelebrityName': p['name'],
                     'Season': season,
@@ -469,7 +556,7 @@ def main():
                     'Loss_Smooth': loss_smooth,
                     'Loss_Corr': loss_corr,
                     'Loss_Reg': loss_reg,
-                    'Status': p['status'] if p['is_eliminated_this_week'] else 'Safe'
+                    'Status': status_out
                 })
                 
     out_df = pd.DataFrame(results)
@@ -477,4 +564,10 @@ def main():
     print(f"Results saved to {OUTPUT_FILE}")
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Calculate audience vote ranges.")
+    parser.add_argument('--is-ml', dest='is_ml', action='store_true', help='Run ML optimization for percent rule.')
+    parser.add_argument('--no-ml', dest='is_ml', action='store_false', help='Reuse ML outputs from OUTPUT_FILE.')
+    parser.set_defaults(is_ml=True)
+    args = parser.parse_args()
+    main(is_ml=bool(args.is_ml))
