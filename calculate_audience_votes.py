@@ -42,6 +42,7 @@ PERCENT_LOSS_CONFIG = PercentLossConfig(
     longtail_shift=0.8,
     constraint_margin=0.0,
     diversity_sigma=0.03,
+    device="cuda",
 )
 
 def build_week_cols_map(score_cols):

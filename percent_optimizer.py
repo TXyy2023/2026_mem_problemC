@@ -48,6 +48,8 @@ class PercentLossConfig:
 
     # Device selection: "auto", "cpu", or "cuda"
     device: str = "auto"
+    # Range optimization batch threshold for GPU path (n <= this -> batched)
+    range_opt_batch_max_n: int = 128
 
 
 def _get_device(config: PercentLossConfig) -> "torch.device":
@@ -78,6 +80,16 @@ def soft_rank(values: "torch.Tensor", tau: float = 1.0) -> "torch.Tensor":
     return ranks
 
 
+def soft_rank_batched(values: "torch.Tensor", tau: float = 1.0) -> "torch.Tensor":
+    """
+    Differentiable soft rank for batched values. values shape: [B, N].
+    """
+    diff = values[:, None, :] - values[:, :, None]
+    P = torch.sigmoid(diff / tau)
+    ranks = 1.0 + P.sum(dim=2) - 0.5
+    return ranks
+
+
 def _target_distribution_from_ranks(
     ranks: "torch.Tensor",
     reg_type: str,
@@ -85,7 +97,20 @@ def _target_distribution_from_ranks(
     longtail_alpha: float,
     longtail_shift: float,
 ) -> "torch.Tensor":
-    n = ranks.shape[0]
+    if ranks.dim() == 1:
+        n = ranks.shape[0]
+        if reg_type == "normal":
+            mu = (n + 1) / 2.0
+            sigma = max(1e-3, n * normal_sigma_factor)
+            weights = torch.exp(-0.5 * ((ranks - mu) / sigma) ** 2)
+        elif reg_type == "longtail":
+            weights = 1.0 / (ranks + longtail_shift) ** longtail_alpha
+        else:
+            raise ValueError(f"Unknown reg_type: {reg_type}")
+        weights = weights / (weights.sum() + 1e-12)
+        return weights
+
+    n = ranks.shape[1]
     if reg_type == "normal":
         mu = (n + 1) / 2.0
         sigma = max(1e-3, n * normal_sigma_factor)
@@ -94,7 +119,7 @@ def _target_distribution_from_ranks(
         weights = 1.0 / (ranks + longtail_shift) ** longtail_alpha
     else:
         raise ValueError(f"Unknown reg_type: {reg_type}")
-    weights = weights / (weights.sum() + 1e-12)
+    weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-12)
     return weights
 
 
@@ -173,6 +198,19 @@ def loss_diversity(audience_p: "torch.Tensor", sigma: float) -> "torch.Tensor":
     return pair_penalty[mask].mean()
 
 
+def loss_diversity_batched(
+    audience_p: "torch.Tensor", sigma: float, upper_mask: "torch.Tensor"
+) -> "torch.Tensor":
+    """
+    Repulsion loss for batched audience percentages. audience_p shape: [B, N].
+    """
+    if audience_p.shape[1] < 2:
+        return torch.zeros(audience_p.shape[0], device=audience_p.device)
+    diff = torch.abs(audience_p[:, :, None] - audience_p[:, None, :])
+    pair_penalty = torch.exp(-diff / max(sigma, 1e-6))
+    return pair_penalty[:, upper_mask].mean(dim=1)
+
+
 def _build_prev_percent_tensor(
     participant_names: List[str],
     prev_percent_map: Dict[str, float],
@@ -210,6 +248,67 @@ def _compute_total_loss(
         longtail_shift=config.longtail_shift,
     )
     l_div = loss_diversity(audience_p, sigma=config.diversity_sigma)
+    return (
+        config.alpha_constraint * l_constraint
+        + config.beta_smooth * l_smooth
+        + config.gamma_corr * l_corr
+        + config.delta_reg * l_reg
+        + config.epsilon_diversity * l_div
+    )
+
+
+def _compute_total_loss_batched(
+    audience_p: "torch.Tensor",
+    judge_p: "torch.Tensor",
+    safe_mask: "torch.Tensor",
+    elim_mask: "torch.Tensor",
+    prev_percent_tensor: "torch.Tensor",
+    config: PercentLossConfig,
+    upper_mask: "torch.Tensor",
+) -> "torch.Tensor":
+    """
+    Batched loss. audience_p shape: [B, N]. Returns loss per batch [B].
+    """
+    ranks = soft_rank_batched(audience_p, tau=config.rank_tau)
+
+    if elim_mask.sum() == 0 or safe_mask.sum() == 0:
+        l_constraint = torch.zeros(audience_p.shape[0], device=audience_p.device)
+    else:
+        total = audience_p + judge_p
+        total_s = total[:, safe_mask]
+        total_e = total[:, elim_mask]
+        violation = config.constraint_margin - (total_s[:, :, None] - total_e[:, None, :])
+        l_constraint = torch.relu(violation).pow(2).mean(dim=(1, 2))
+
+    mask = prev_percent_tensor >= 0
+    if mask.sum() == 0:
+        l_smooth = torch.zeros(audience_p.shape[0], device=audience_p.device)
+    else:
+        allowed = prev_percent_tensor / 2.0
+        violation = allowed - audience_p
+        l_smooth = torch.relu(violation[:, mask]).pow(2).mean(dim=1)
+
+    if audience_p.shape[1] < 2:
+        l_corr = torch.zeros(audience_p.shape[0], device=audience_p.device)
+    else:
+        a = audience_p - audience_p.mean(dim=1, keepdim=True)
+        j = judge_p - judge_p.mean()
+        denom = (a.std(dim=1, unbiased=False) * j.std(unbiased=False)) + 1e-12
+        corr = (a * j).mean(dim=1) / denom
+        l_corr = 1.0 - corr
+
+    target = _target_distribution_from_ranks(
+        ranks,
+        reg_type=config.reg_type,
+        normal_sigma_factor=config.normal_sigma_factor,
+        longtail_alpha=config.longtail_alpha,
+        longtail_shift=config.longtail_shift,
+    )
+    eps = 1e-12
+    l_reg = (audience_p * (audience_p.add(eps).log() - target.add(eps).log())).sum(dim=1)
+
+    l_div = loss_diversity_batched(audience_p, sigma=config.diversity_sigma, upper_mask=upper_mask)
+
     return (
         config.alpha_constraint * l_constraint
         + config.beta_smooth * l_smooth
@@ -457,11 +556,78 @@ def optimize_audience_percent_ranges_loss_bounded(
 
         return float(best_val) if best_val is not None else float(base_audience[target_idx])
 
+    def _optimize_targets_batched(direction: str) -> np.ndarray:
+        base = torch.tensor(base_logits, dtype=torch.float32, device=device)
+        targets = torch.arange(n, device=device)
+        upper_mask = torch.triu(
+            torch.ones((n, n), dtype=torch.bool, device=device), diagonal=1
+        )
+
+        best_val = torch.full((n,), float("nan"), device=device)
+        best_violation = torch.full((n,), float("inf"), device=device)
+
+        for attempt in range(attempts):
+            penalty = penalty_base * (penalty_growth ** attempt)
+            logits = torch.nn.Parameter(base.repeat(n, 1))
+            opt = torch.optim.Adam([logits], lr=lr)
+
+            for _ in range(steps):
+                aud = torch.softmax(logits / config.temperature, dim=1)
+                total_loss = _compute_total_loss_batched(
+                    aud, judge_p, safe_mask_t, elim_mask, prev_percent_tensor, config, upper_mask
+                )
+                violation = torch.relu(total_loss - loss_threshold)
+                target_vals = aud[targets, targets]
+                if direction == "min":
+                    obj = target_vals + penalty * violation
+                else:
+                    obj = -target_vals + penalty * violation
+
+                opt.zero_grad(set_to_none=True)
+                obj.sum().backward()
+                opt.step()
+
+            with torch.no_grad():
+                aud = torch.softmax(logits / config.temperature, dim=1)
+                total_loss = _compute_total_loss_batched(
+                    aud, judge_p, safe_mask_t, elim_mask, prev_percent_tensor, config, upper_mask
+                )
+                violation = torch.clamp(total_loss - loss_threshold, min=0.0)
+                candidate = aud[targets, targets]
+
+            better = violation <= 1e-6
+            if direction == "min":
+                update = torch.where(
+                    better,
+                    torch.where(torch.isnan(best_val), candidate, torch.minimum(best_val, candidate)),
+                    torch.where(violation < best_violation, candidate, best_val),
+                )
+            else:
+                update = torch.where(
+                    better,
+                    torch.where(torch.isnan(best_val), candidate, torch.maximum(best_val, candidate)),
+                    torch.where(violation < best_violation, candidate, best_val),
+                )
+            best_val = torch.where(torch.isnan(best_val), update, update)
+            best_violation = torch.minimum(best_violation, violation)
+
+        best_val = torch.where(
+            torch.isnan(best_val),
+            torch.tensor(base_audience, dtype=torch.float32, device=device),
+            best_val,
+        )
+        return best_val.detach().cpu().numpy()
+
     min_vals = np.zeros(n, dtype=float)
     max_vals = np.zeros(n, dtype=float)
-    target_iter = trange(n, desc="Range opt", leave=False) if trange is not None else range(n)
-    for i in target_iter:
-        min_vals[i] = _optimize_target(i, "min")
-        max_vals[i] = _optimize_target(i, "max")
+
+    if device.type == "cuda" and n <= config.range_opt_batch_max_n:
+        min_vals = _optimize_targets_batched("min")
+        max_vals = _optimize_targets_batched("max")
+    else:
+        target_iter = trange(n, desc="Range opt", leave=False) if trange is not None else range(n)
+        for i in target_iter:
+            min_vals[i] = _optimize_target(i, "min")
+            max_vals[i] = _optimize_target(i, "max")
 
     return min_vals, max_vals, loss_threshold
