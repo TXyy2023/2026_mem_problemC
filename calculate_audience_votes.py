@@ -16,7 +16,7 @@ OUTPUT_FILE = '/Users/a1234/Desktop/美赛/MCM_Problem_C_Results.csv'
 PERCENT_LOSS_CONFIG = PercentLossConfig(
     alpha_constraint=80.0,  # large penalty for violating elimination constraints
     beta_smooth=2.0,
-    gamma_corr=10.0,
+    gamma_corr=1.0,
     delta_reg=0.6,
     steps=700,
     lr=0.06,
@@ -28,6 +28,12 @@ PERCENT_LOSS_CONFIG = PercentLossConfig(
     longtail_shift=0.8,
     constraint_margin=0.0,
 )
+
+# If True, use MC-derived CI for percent and write to Possible_Audience_Vote_Range.
+IS_CI = True
+MC_SAMPLES = 5000
+MC_NOISE_STD = 0.01  # std for Gaussian noise on judge percents
+MC_SEED = 42
 
 def build_week_cols_map(score_cols):
     week_cols_map = {}
@@ -100,6 +106,42 @@ def parse_result_status(df, score_cols):
                     df.at[idx, 'ElimRank'] = placement
             
     return df
+
+def _sample_judge_percents(base_percents, rng, noise_std):
+    noisy = np.array(base_percents, dtype=np.float64) + rng.normal(0.0, noise_std, size=len(base_percents))
+    noisy = np.clip(noisy, 1e-8, None)
+    noisy = noisy / noisy.sum()
+    return noisy.tolist()
+
+def monte_carlo_percent_ci(
+    judge_percents,
+    eliminated_mask,
+    safe_mask,
+    prev_percent_map,
+    participant_names,
+    config,
+    samples=200,
+    noise_std=0.01,
+    seed=42,
+):
+    rng = np.random.default_rng(seed)
+    all_samples = []
+    for _ in range(samples):
+        noisy_j = _sample_judge_percents(judge_percents, rng, noise_std)
+        aud_pcts, _, _ = optimize_audience_percent(
+            judge_percents=noisy_j,
+            eliminated_mask=eliminated_mask,
+            safe_mask=safe_mask,
+            prev_percent_map=prev_percent_map,
+            participant_names=participant_names,
+            config=config,
+        )
+        all_samples.append(aud_pcts)
+    samples_arr = np.vstack(all_samples)
+    mean_p = samples_arr.mean(axis=0)
+    low = np.percentile(samples_arr, 2.5, axis=0)
+    high = np.percentile(samples_arr, 97.5, axis=0)
+    return mean_p, low, high
 
 def get_weekly_participants(df, season, week, score_cols):
     """
@@ -393,6 +435,8 @@ def main(is_ml=True):
                     key = (row.get('CelebrityName'), int(row.get('Season')), int(row.get('Week')), row.get('RuleType'))
                     prev_ml_map[key] = {
                         'Predicted_Audience_Percent': row.get('Predicted_Audience_Percent'),
+                        'Predicted_Audience_Percent_CI_Lower': row.get('Predicted_Audience_Percent_CI_Lower'),
+                        'Predicted_Audience_Percent_CI_Upper': row.get('Predicted_Audience_Percent_CI_Upper'),
                         'Predicted_Audience_Rank': row.get('Predicted_Audience_Rank'),
                         'Loss_Total': row.get('Loss_Total'),
                         'Loss_Constraint': row.get('Loss_Constraint'),
@@ -432,6 +476,8 @@ def main(is_ml=True):
 
             # Percent rule optimization (backprop) computed once per week
             week_aud_pcts = None
+            week_aud_ci_low = None
+            week_aud_ci_high = None
             week_aud_ranks = None
             week_loss = None
             if rule_type == 'Percent' and is_ml:
@@ -447,14 +493,30 @@ def main(is_ml=True):
                 ]
                 names = [p['name'] for p in participants]
 
-                week_aud_pcts, week_aud_ranks, week_loss = optimize_audience_percent(
-                    judge_percents=judge_percents,
-                    eliminated_mask=eliminated_mask,
-                    safe_mask=safe_mask,
-                    prev_percent_map=prev_percent_map,
-                    participant_names=names,
-                    config=PERCENT_LOSS_CONFIG,
-                )
+                if IS_CI:
+                    week_aud_pcts, week_aud_ci_low, week_aud_ci_high = monte_carlo_percent_ci(
+                        judge_percents=judge_percents,
+                        eliminated_mask=eliminated_mask,
+                        safe_mask=safe_mask,
+                        prev_percent_map=prev_percent_map,
+                        participant_names=names,
+                        config=PERCENT_LOSS_CONFIG,
+                        samples=MC_SAMPLES,
+                        noise_std=MC_NOISE_STD,
+                        seed=MC_SEED + int(season) * 100 + int(week),
+                    )
+                    # Use mean for ranks and loss from a single deterministic run (base judge percents)
+                    week_aud_ranks = None
+                    week_loss = None
+                else:
+                    week_aud_pcts, week_aud_ranks, week_loss = optimize_audience_percent(
+                        judge_percents=judge_percents,
+                        eliminated_mask=eliminated_mask,
+                        safe_mask=safe_mask,
+                        prev_percent_map=prev_percent_map,
+                        participant_names=names,
+                        config=PERCENT_LOSS_CONFIG,
+                    )
 
                 # Update previous week map for smoothness in next week
                 prev_percent_map = {
@@ -465,6 +527,8 @@ def main(is_ml=True):
                 val_range = ""
                 j_norm = ""
                 pred_aud_pct = None
+                pred_aud_ci_low = None
+                pred_aud_ci_high = None
                 pred_aud_rank = None
                 loss_total = None
                 loss_constraint = None
@@ -513,24 +577,36 @@ def main(is_ml=True):
                     # Predicted audience percent/rank from backprop optimization
                     if is_ml and week_aud_pcts is not None:
                         pred_aud_pct = float(week_aud_pcts[idx_p] * 100.0)
-                        pred_aud_rank = int(round(week_aud_ranks[idx_p]))
-                        if week_loss is not None:
-                            loss_total = float(week_loss['total'])
-                            loss_constraint = float(week_loss['constraint'])
-                            loss_smooth = float(week_loss['smooth'])
-                            loss_corr = float(week_loss['corr'])
-                            loss_reg = float(week_loss['reg'])
+                        if IS_CI and week_aud_ci_low is not None and week_aud_ci_high is not None:
+                            pred_aud_ci_low = float(week_aud_ci_low[idx_p] * 100.0)
+                            pred_aud_ci_high = float(week_aud_ci_high[idx_p] * 100.0)
+                            val_range = f"{pred_aud_ci_low:.1f}%-{pred_aud_ci_high:.1f}%"
+                        if not IS_CI and week_aud_ranks is not None:
+                            pred_aud_rank = int(round(week_aud_ranks[idx_p]))
+                            if week_loss is not None:
+                                loss_total = float(week_loss['total'])
+                                loss_constraint = float(week_loss['constraint'])
+                                loss_smooth = float(week_loss['smooth'])
+                                loss_corr = float(week_loss['corr'])
+                                loss_reg = float(week_loss['reg'])
                     elif not is_ml:
                         key = (p['name'], int(season), int(week), rule_type)
                         cached = prev_ml_map.get(key)
                         if cached:
                             pred_aud_pct = cached.get('Predicted_Audience_Percent')
+                            pred_aud_ci_low = cached.get('Predicted_Audience_Percent_CI_Lower')
+                            pred_aud_ci_high = cached.get('Predicted_Audience_Percent_CI_Upper')
                             pred_aud_rank = cached.get('Predicted_Audience_Rank')
                             loss_total = cached.get('Loss_Total')
                             loss_constraint = cached.get('Loss_Constraint')
                             loss_smooth = cached.get('Loss_Smooth')
                             loss_corr = cached.get('Loss_Corr')
                             loss_reg = cached.get('Loss_Reg')
+                            if IS_CI and pred_aud_ci_low is not None and pred_aud_ci_high is not None:
+                                try:
+                                    val_range = f"{float(pred_aud_ci_low):.1f}%-{float(pred_aud_ci_high):.1f}%"
+                                except Exception:
+                                    pass
                 
                 status_out = 'Safe'
                 if p['status'] == 'Withdrew':
@@ -550,6 +626,8 @@ def main(is_ml=True):
                     'JudgeScore_Normalization': j_norm,
                     'Possible_Audience_Vote_Range': val_range,
                     'Predicted_Audience_Percent': pred_aud_pct,
+                    'Predicted_Audience_Percent_CI_Lower': pred_aud_ci_low,
+                    'Predicted_Audience_Percent_CI_Upper': pred_aud_ci_high,
                     'Predicted_Audience_Rank': pred_aud_rank,
                     'Loss_Total': loss_total,
                     'Loss_Constraint': loss_constraint,
