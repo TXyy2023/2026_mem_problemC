@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import warnings
 import re
-import os
 from datetime import datetime
 
 try:
@@ -19,20 +18,19 @@ warnings.filterwarnings('ignore')
 
 INPUT_FILE = '2026_MCM_Problem_C_Data.csv'
 OUTPUT_PREFIX = 'MCM_Problem_C_Results'
-OUTPUT_BASE = f'{OUTPUT_PREFIX}.csv'
 OUTPUT_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M')
 OUTPUT_FILE = f'{OUTPUT_PREFIX}_{OUTPUT_TIMESTAMP}.csv'
 
 # Percent-rule optimization config (loss modularized in percent_optimizer.py)
 PERCENT_LOSS_CONFIG = PercentLossConfig(
-    alpha_constraint=80.0,  # large penalty for violating elimination constraints
-    beta_smooth=2.0,
-    gamma_corr=1.0,
-    delta_reg=0.6,
-    epsilon_diversity=0.2,
-    steps=700,
-    lr=0.06,
-    temperature=1.0,
+    alpha_constraint=120.0,  # large penalty for violating elimination constraints
+    beta_smooth=4.0,
+    gamma_corr=2.0,
+    delta_reg=1,
+    epsilon_diversity=1,
+    steps=2000,
+    lr=0.005,
+    temperature=0.8,
     rank_tau=0.45,
     reg_type="longtail",
     normal_sigma_factor=0.28,
@@ -308,16 +306,153 @@ def solve_rank_rule_inverse(target_p, participants, n_participants):
         
     return min(valid_a), max(valid_a)
 
-def _select_prev_output_file():
-    candidates = []
-    for name in os.listdir('.'):
-        if name == OUTPUT_BASE or (name.startswith(f'{OUTPUT_PREFIX}_') and name.endswith('.csv')):
-            candidates.append(name)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: os.path.getmtime(p))
+def _process_season(
+    season: int,
+    df: pd.DataFrame,
+    score_cols: list,
+    is_ml: bool,
+):
+    results = []
 
-def main(is_ml=True):
+    # Determine Rule Type
+    rule_type = 'Percent'
+    if season <= 2 or season >= 28:
+        rule_type = 'Rank'
+
+    prev_percent_map = {}
+
+    # Get weeks
+    weeks = set()
+    for c in score_cols:
+        try:
+            week_num = int(c.split('_')[0].replace('week', ''))
+            weeks.add(week_num)
+        except Exception:
+            pass
+    sorted_weeks = sorted(list(weeks))
+
+    for week in sorted_weeks:
+        participants = get_weekly_participants(df, season, week, score_cols)
+        if not participants:
+            continue
+
+        n_p = len(participants)
+
+        # Percent rule optimization (backprop) computed once per week
+        week_aud_pcts = None
+        week_aud_ranks = None
+        week_loss = None
+        prev_percent_map_for_week = prev_percent_map
+
+        if rule_type == 'Percent' and is_ml:
+            total_J = sum(p['total_score'] for p in participants)
+            judge_percents = [
+                (p['total_score'] / total_J) if total_J > 0 else 0.0
+                for p in participants
+            ]
+            eliminated_mask = [p['is_eliminated_this_week'] for p in participants]
+            safe_mask = [
+                (not p['is_eliminated_this_week']) and p['status'] != 'Withdrew'
+                for p in participants
+            ]
+            names = [p['name'] for p in participants]
+
+            week_aud_pcts, week_aud_ranks, week_loss = optimize_audience_percent(
+                judge_percents=judge_percents,
+                eliminated_mask=eliminated_mask,
+                safe_mask=safe_mask,
+                prev_percent_map=prev_percent_map_for_week,
+                participant_names=names,
+                config=PERCENT_LOSS_CONFIG,
+            )
+
+            # Update previous week map for smoothness in next week
+            prev_percent_map = {
+                names[i]: float(week_aud_pcts[i]) for i in range(len(names))
+            }
+
+        for idx_p, p in enumerate(participants):
+            val_range = ""
+            j_norm = ""
+            pred_aud_pct = None
+            pred_aud_rank = None
+            loss_total = None
+            loss_constraint = None
+            loss_smooth = None
+            loss_corr = None
+            loss_reg = None
+            loss_diversity = None
+
+            if rule_type == 'Rank':
+                min_r, max_r = solve_rank_rule_inverse(p, participants, n_p)
+                val_range = f"{min_r}-{max_r}"
+                sorted_temp = sorted(participants, key=lambda x: x['total_score'], reverse=True)
+                my_j = 0
+
+                # Dense Ranking Logic
+                current_rank = 0
+                prev_score = None
+
+                for i, x in enumerate(sorted_temp):
+                    if x['total_score'] != prev_score:
+                        current_rank += 1
+                    x['drank'] = current_rank
+                    prev_score = x['total_score']
+
+                    if x['id'] == p['id']:
+                        my_j = x['drank']
+                j_norm = str(my_j)
+
+            else:
+                val_range = ""
+                total_s = sum(x['total_score'] for x in participants)
+                j_p = (p['total_score'] / total_s) * 100 if total_s > 0 else 0
+                j_norm = f"{j_p:.1f}%"
+
+                # Predicted audience percent/rank from backprop optimization
+                if is_ml and week_aud_pcts is not None:
+                    pred_aud_pct = float(week_aud_pcts[idx_p] * 100.0)
+                    pred_aud_rank = int(round(week_aud_ranks[idx_p]))
+                    if week_loss is not None:
+                        loss_total = float(week_loss['total'])
+                        loss_constraint = float(week_loss['constraint'])
+                        loss_smooth = float(week_loss['smooth'])
+                        loss_corr = float(week_loss['corr'])
+                        loss_reg = float(week_loss['reg'])
+                        loss_diversity = float(week_loss['diversity'])
+
+            status_out = 'Safe'
+            if p['status'] == 'Withdrew':
+                status_out = 'Withdrew'
+            elif p['is_eliminated_this_week']:
+                if p.get('elim_rank') is not None:
+                    status_out = f"Eliminated (Place {int(p['elim_rank'])})"
+                else:
+                    status_out = 'Eliminated'
+
+            results.append({
+                'CelebrityName': p['name'],
+                'Season': season,
+                'Week': week,
+                'RuleType': rule_type,
+                'JudgeScore': p['total_score'],
+                'JudgeScore_Normalization': j_norm,
+                'Possible_Audience_Vote_Range': val_range,
+                'Predicted_Audience_Percent': pred_aud_pct,
+                'Predicted_Audience_Rank': pred_aud_rank,
+                'Loss_Total': loss_total,
+                'Loss_Constraint': loss_constraint,
+                'Loss_Smooth': loss_smooth,
+                'Loss_Corr': loss_corr,
+                'Loss_Reg': loss_reg,
+                'Loss_Diversity': loss_diversity,
+                'Status': status_out
+            })
+
+    return results
+
+
+def main(is_ml=True, season_workers: int = 1):
     print(f"Loading data from {INPUT_FILE}...")
     df = pd.read_csv(INPUT_FILE)
     score_cols = [c for c in df.columns if 'judge' in c and 'score' in c and 'week' in c]
@@ -327,30 +462,6 @@ def main(is_ml=True):
     results = []
     global sorted_weeks # Hack for global access in get_participants
     
-    # Load prior ML outputs if needed
-    prev_ml_map = {}
-    if not is_ml:
-        prev_file = _select_prev_output_file()
-        if prev_file and os.path.exists(prev_file):
-            try:
-                prev_df = pd.read_csv(prev_file)
-                for _, row in prev_df.iterrows():
-                    key = (row.get('CelebrityName'), int(row.get('Season')), int(row.get('Week')), row.get('RuleType'))
-                    prev_ml_map[key] = {
-                        'Predicted_Audience_Percent': row.get('Predicted_Audience_Percent'),
-                        'Predicted_Audience_Rank': row.get('Predicted_Audience_Rank'),
-                        'Loss_Total': row.get('Loss_Total'),
-                        'Loss_Constraint': row.get('Loss_Constraint'),
-                        'Loss_Smooth': row.get('Loss_Smooth'),
-                        'Loss_Corr': row.get('Loss_Corr'),
-                        'Loss_Reg': row.get('Loss_Reg'),
-                        'Loss_Diversity': row.get('Loss_Diversity'),
-                    }
-            except Exception as e:
-                print(f"Warning: failed to read previous ML output from {prev_file}: {e}")
-        else:
-            print("Warning: no prior output file found; ML fields will be empty.")
-
     total_weeks = 0
     for season in seasons:
         week_set = set()
@@ -364,168 +475,41 @@ def main(is_ml=True):
 
     week_progress = tqdm(total=total_weeks, desc="Total progress", leave=True) if tqdm is not None else None
 
-    for season in seasons:
-        # Determine Rule Type
-        rule_type = 'Percent'
-        if season <= 2 or season >= 28:
-            rule_type = 'Rank'
+    if season_workers is None or int(season_workers) < 1:
+        season_workers = 1
 
-        prev_percent_map = {}
-            
-        # Get weeks
-        weeks = set()
-        for c in score_cols:
-            try:
-                week_num = int(c.split('_')[0].replace('week', ''))
-                weeks.add(week_num)
-            except:
-                pass
-        sorted_weeks = sorted(list(weeks))
-        
-        for week in sorted_weeks:
-            participants = get_weekly_participants(df, season, week, score_cols)
-            if not participants:
-                if week_progress is not None:
-                    week_progress.update(1)
-                continue
-                
-            n_p = len(participants)
-
-            # Percent rule optimization (backprop) computed once per week
-            week_aud_pcts = None
-            week_aud_ranks = None
-            week_loss = None
-            prev_percent_map_for_week = prev_percent_map
-
-            if rule_type == 'Percent' and is_ml:
-                total_J = sum(p['total_score'] for p in participants)
-                judge_percents = [
-                    (p['total_score'] / total_J) if total_J > 0 else 0.0
-                    for p in participants
-                ]
-                eliminated_mask = [p['is_eliminated_this_week'] for p in participants]
-                safe_mask = [
-                    (not p['is_eliminated_this_week']) and p['status'] != 'Withdrew'
-                    for p in participants
-                ]
-                names = [p['name'] for p in participants]
-
-                week_aud_pcts, week_aud_ranks, week_loss = optimize_audience_percent(
-                    judge_percents=judge_percents,
-                    eliminated_mask=eliminated_mask,
-                    safe_mask=safe_mask,
-                    prev_percent_map=prev_percent_map_for_week,
-                    participant_names=names,
-                    config=PERCENT_LOSS_CONFIG,
-                )
-
-                # Update previous week map for smoothness in next week
-                prev_percent_map = {
-                    names[i]: float(week_aud_pcts[i]) for i in range(len(names))
-                }
-            
-            for idx_p, p in enumerate(participants):
-                val_range = ""
-                j_norm = ""
-                pred_aud_pct = None
-                pred_aud_rank = None
-                loss_total = None
-                loss_constraint = None
-                loss_smooth = None
-                loss_corr = None
-                loss_reg = None
-                loss_diversity = None
-                
-                if rule_type == 'Rank':
-                    min_r, max_r = solve_rank_rule_inverse(p, participants, n_p)
-                    val_range = f"{min_r}-{max_r}"
-                    # Judge Norm: Judge Rank
-                    # Need to retrieve J Rank calculated inside logic or redo
-                    # Just calculate simply here
-                    matches = [x for x in participants if x['id'] == p['id']]
-                    # It's messy to retrieve, recalculate J Rank
-                    # Or reuse logic
-                    # Let's clean up: Calculate J_ranks centrally
-                    # Just do quick rank for display
-                    # ... (skip for brevity, logic exists in solve)
-                    # We will output Placeholders or move logic out.
-                    # Redo J Rank for display:
-                    sorted_temp = sorted(participants, key=lambda x: x['total_score'], reverse=True)
-                    my_j = 0
-                    
-                    # Dense Ranking Logic
-                    current_rank = 0
-                    prev_score = None
-                    
-                    for i, x in enumerate(sorted_temp):
-                        if x['total_score'] != prev_score:
-                            current_rank += 1
-                        x['drank'] = current_rank
-                        prev_score = x['total_score']
-                        
-                        if x['id'] == p['id']:
-                            my_j = x['drank']
-                    j_norm = str(my_j)
-                    
-                else:
-                    val_range = ""
-                    total_s = sum(x['total_score'] for x in participants)
-                    j_p = (p['total_score'] / total_s) * 100 if total_s > 0 else 0
-                    j_norm = f"{j_p:.1f}%"
-
-                    # Predicted audience percent/rank from backprop optimization
-                    if is_ml and week_aud_pcts is not None:
-                        pred_aud_pct = float(week_aud_pcts[idx_p] * 100.0)
-                        pred_aud_rank = int(round(week_aud_ranks[idx_p]))
-                        if week_loss is not None:
-                            loss_total = float(week_loss['total'])
-                            loss_constraint = float(week_loss['constraint'])
-                            loss_smooth = float(week_loss['smooth'])
-                            loss_corr = float(week_loss['corr'])
-                            loss_reg = float(week_loss['reg'])
-                            loss_diversity = float(week_loss['diversity'])
-                    elif not is_ml:
-                        key = (p['name'], int(season), int(week), rule_type)
-                        cached = prev_ml_map.get(key)
-                        if cached:
-                            pred_aud_pct = cached.get('Predicted_Audience_Percent')
-                            pred_aud_rank = cached.get('Predicted_Audience_Rank')
-                            loss_total = cached.get('Loss_Total')
-                            loss_constraint = cached.get('Loss_Constraint')
-                            loss_smooth = cached.get('Loss_Smooth')
-                            loss_corr = cached.get('Loss_Corr')
-                            loss_reg = cached.get('Loss_Reg')
-                            loss_diversity = cached.get('Loss_Diversity')
-                
-                status_out = 'Safe'
-                if p['status'] == 'Withdrew':
-                    status_out = 'Withdrew'
-                elif p['is_eliminated_this_week']:
-                    if p.get('elim_rank') is not None:
-                        status_out = f"Eliminated (Place {int(p['elim_rank'])})"
-                    else:
-                        status_out = 'Eliminated'
-
-                results.append({
-                    'CelebrityName': p['name'],
-                    'Season': season,
-                    'Week': week,
-                    'RuleType': rule_type,
-                    'JudgeScore': p['total_score'],
-                    'JudgeScore_Normalization': j_norm,
-                    'Possible_Audience_Vote_Range': val_range,
-                    'Predicted_Audience_Percent': pred_aud_pct,
-                    'Predicted_Audience_Rank': pred_aud_rank,
-                    'Loss_Total': loss_total,
-                    'Loss_Constraint': loss_constraint,
-                    'Loss_Smooth': loss_smooth,
-                    'Loss_Corr': loss_corr,
-                    'Loss_Reg': loss_reg,
-                    'Loss_Diversity': loss_diversity,
-                    'Status': status_out
-                })
+    if season_workers == 1:
+        for season in seasons:
+            results.extend(_process_season(season, df, score_cols, is_ml))
             if week_progress is not None:
-                week_progress.update(1)
+                # Approximate progress: mark all weeks for this season as done.
+                season_weeks = set()
+                for c in score_cols:
+                    try:
+                        week_num = int(c.split('_')[0].replace('week', ''))
+                        season_weeks.add(week_num)
+                    except Exception:
+                        pass
+                week_progress.update(len(season_weeks))
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        with ProcessPoolExecutor(max_workers=int(season_workers)) as ex:
+            futures = {
+                ex.submit(_process_season, season, df, score_cols, is_ml): season
+                for season in seasons
+            }
+            for fut in as_completed(futures):
+                results.extend(fut.result())
+                if week_progress is not None:
+                    season_weeks = set()
+                    for c in score_cols:
+                        try:
+                            week_num = int(c.split('_')[0].replace('week', ''))
+                            season_weeks.add(week_num)
+                        except Exception:
+                            pass
+                    week_progress.update(len(season_weeks))
     if week_progress is not None:
         week_progress.close()
                 
@@ -558,9 +542,17 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="Calculate audience vote ranges.")
     parser.add_argument('--is-ml', dest='is_ml', action='store_true', help='Run ML optimization for percent rule.')
-    parser.add_argument('--no-ml', dest='is_ml', action='store_false', help='Reuse ML outputs from latest output file.')
+    parser.add_argument('--no-ml', dest='is_ml', action='store_false', help='Skip ML optimization for percent rule.')
+    parser.add_argument(
+        '--season-workers',
+        dest='season_workers',
+        type=int,
+        default=1,
+        help='Parallel workers for season-level processing (CPU-side).',
+    )
     parser.set_defaults(is_ml=True)
     args = parser.parse_args()
     main(
         is_ml=bool(args.is_ml),
+        season_workers=int(args.season_workers),
     )
