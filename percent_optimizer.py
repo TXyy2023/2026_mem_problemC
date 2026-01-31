@@ -356,7 +356,8 @@ def optimize_audience_percent_ranges_loss_bounded(
     config: PercentLossConfig,
     base_audience_percents: np.ndarray,
     min_total_loss: float,
-    loss_slack_ratio: float = 0.5,
+    loss_slack_ratio: float = None,
+    loss_threshold_multiplier: float = 1.5,
     steps: int = 250,
     lr: float = None,
     penalty_base: float = 50.0,
@@ -388,7 +389,13 @@ def optimize_audience_percent_ranges_loss_bounded(
     base_audience = base_audience / base_audience.sum()
     base_logits = np.log(base_audience)
 
-    loss_threshold = float(min_total_loss) * (1.0 + float(loss_slack_ratio))
+    if loss_threshold_multiplier is None:
+        slack = 0.0 if loss_slack_ratio is None else float(loss_slack_ratio)
+        loss_threshold_multiplier = 1.0 + slack
+    else:
+        loss_threshold_multiplier = float(loss_threshold_multiplier)
+
+    loss_threshold = float(min_total_loss) * loss_threshold_multiplier
     lr = float(config.lr if lr is None else lr)
 
     def _optimize_target(target_idx: int, direction: str) -> float:

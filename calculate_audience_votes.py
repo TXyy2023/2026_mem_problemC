@@ -6,6 +6,11 @@ import re
 import os
 from datetime import datetime
 
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
 from percent_optimizer import (
     PercentLossConfig,
     optimize_audience_percent,
@@ -392,7 +397,7 @@ def _select_prev_output_file():
         return None
     return max(candidates, key=lambda p: os.path.getmtime(p))
 
-def main(is_ml=True, is_percent_range=False):
+def main(is_ml=True, is_percent_range=False, loss_threshold_multiplier=1.5):
     print(f"Loading data from {INPUT_FILE}...")
     df = pd.read_csv(INPUT_FILE)
     score_cols = [c for c in df.columns if 'judge' in c and 'score' in c and 'week' in c]
@@ -426,6 +431,19 @@ def main(is_ml=True, is_percent_range=False):
         else:
             print("Warning: no prior output file found; ML fields will be empty.")
 
+    total_weeks = 0
+    for season in seasons:
+        week_set = set()
+        for c in score_cols:
+            try:
+                week_num = int(c.split('_')[0].replace('week', ''))
+                week_set.add(week_num)
+            except:
+                pass
+        total_weeks += len(week_set)
+
+    week_progress = tqdm(total=total_weeks, desc="Total progress", leave=True) if tqdm is not None else None
+
     for season in seasons:
         # Determine Rule Type
         rule_type = 'Percent'
@@ -447,6 +465,8 @@ def main(is_ml=True, is_percent_range=False):
         for week in sorted_weeks:
             participants = get_weekly_participants(df, season, week, score_cols)
             if not participants:
+                if week_progress is not None:
+                    week_progress.update(1)
                 continue
                 
             n_p = len(participants)
@@ -491,7 +511,7 @@ def main(is_ml=True, is_percent_range=False):
                         config=PERCENT_LOSS_CONFIG,
                         base_audience_percents=week_aud_pcts,
                         min_total_loss=week_loss['total'],
-                        loss_slack_ratio=0.5,
+                        loss_threshold_multiplier=loss_threshold_multiplier,
                     )
 
                 # Update previous week map for smoothness in next week
@@ -605,6 +625,10 @@ def main(is_ml=True, is_percent_range=False):
                     'Loss_Diversity': loss_diversity,
                     'Status': status_out
                 })
+            if week_progress is not None:
+                week_progress.update(1)
+    if week_progress is not None:
+        week_progress.close()
                 
     out_df = pd.DataFrame(results)
     if is_ml:
@@ -638,7 +662,18 @@ if __name__ == '__main__':
     parser.add_argument('--no-ml', dest='is_ml', action='store_false', help='Reuse ML outputs from latest output file.')
     parser.add_argument('--percent-range', dest='is_percent_range', action='store_true', help='Use loss-bounded percent ranges.')
     parser.add_argument('--no-percent-range', dest='is_percent_range', action='store_false', help='Use elimination-only percent ranges.')
+    parser.add_argument(
+        '--loss-threshold-multiplier',
+        dest='loss_threshold_multiplier',
+        type=float,
+        default=1,
+        help='Loss threshold multiplier for loss-bounded percent ranges (e.g., 1.5 = 150%).',
+    )
     parser.set_defaults(is_ml=True)
     parser.set_defaults(is_percent_range=True)
     args = parser.parse_args()
-    main(is_ml=bool(args.is_ml), is_percent_range=bool(args.is_percent_range))
+    main(
+        is_ml=bool(args.is_ml),
+        is_percent_range=bool(args.is_percent_range),
+        loss_threshold_multiplier=float(args.loss_threshold_multiplier),
+    )
