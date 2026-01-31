@@ -102,4 +102,25 @@ L_reg = sum( audience_p * (log(audience_p + eps) - log(target + eps)) )
 ```
 
 其中 `eps = 1e-12`。
+ 
+## 5. Diversity loss L_diversity (repulsion)
 
+Goal: penalize audience percentages that are too close within the same week.
+
+Definition:
+```
+L_diversity = mean( exp(-|a_i - a_j| / sigma) ),  i < j
+```
+
+Where:
+- `a_i` are the audience percentages for the week
+- `sigma = diversity_sigma`
+
+Updated total loss:
+```
+L_total = alpha_constraint * L_constraint
+        + beta_smooth * L_smooth
+        + gamma_corr * L_corr
+        + delta_reg * L_reg
+        + epsilon_diversity * L_diversity
+```

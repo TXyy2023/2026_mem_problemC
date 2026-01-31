@@ -11,6 +11,11 @@ except Exception as exc:  # pragma: no cover - handled by caller
 else:
     _TORCH_IMPORT_ERROR = None
 
+try:
+    from tqdm import trange
+except Exception:  # pragma: no cover - optional dependency
+    trange = None
+
 
 @dataclass
 class PercentLossConfig:
@@ -19,6 +24,7 @@ class PercentLossConfig:
     beta_smooth: float = 1.0
     gamma_corr: float = 1.0
     delta_reg: float = 0.5
+    epsilon_diversity: float = 0.05
 
     # Optimization
     steps: int = 600
@@ -36,6 +42,9 @@ class PercentLossConfig:
 
     # Constraint margin
     constraint_margin: float = 0.0
+
+    # Diversity (repulsion) loss
+    diversity_sigma: float = 0.03
 
 
 def _require_torch() -> None:
@@ -140,6 +149,65 @@ def loss_reg(
     return (audience_p * (audience_p.add(eps).log() - target.add(eps).log())).sum()
 
 
+def loss_diversity(audience_p: "torch.Tensor", sigma: float) -> "torch.Tensor":
+    """
+    Repulsion loss: penalize close audience percentages.
+    """
+    if audience_p.shape[0] < 2:
+        return torch.tensor(0.0, device=audience_p.device)
+    diff = torch.abs(audience_p[:, None] - audience_p[None, :])
+    # Exclude diagonal and avoid counting pairs twice.
+    mask = torch.triu(torch.ones_like(diff, dtype=torch.bool), diagonal=1)
+    pair_penalty = torch.exp(-diff / max(sigma, 1e-6))
+    return pair_penalty[mask].mean()
+
+
+def _build_prev_percent_tensor(
+    participant_names: List[str],
+    prev_percent_map: Dict[str, float],
+    device: "torch.device",
+) -> "torch.Tensor":
+    n = len(participant_names)
+    prev_percent_tensor = torch.full((n,), -1.0, dtype=torch.float32, device=device)
+    if prev_percent_map:
+        for i, name in enumerate(participant_names):
+            if name in prev_percent_map:
+                prev_percent_tensor[i] = float(prev_percent_map[name])
+    return prev_percent_tensor
+
+
+def _compute_total_loss(
+    audience_p: "torch.Tensor",
+    judge_p: "torch.Tensor",
+    safe_mask: "torch.Tensor",
+    elim_mask: "torch.Tensor",
+    prev_percent_tensor: "torch.Tensor",
+    config: PercentLossConfig,
+) -> "torch.Tensor":
+    ranks = soft_rank(audience_p, tau=config.rank_tau)
+    l_constraint = loss_constraint(
+        audience_p, judge_p, safe_mask, elim_mask, margin=config.constraint_margin
+    )
+    l_smooth = loss_smooth(audience_p, prev_percent_tensor)
+    l_corr = loss_corr(audience_p, judge_p)
+    l_reg = loss_reg(
+        audience_p,
+        ranks,
+        reg_type=config.reg_type,
+        normal_sigma_factor=config.normal_sigma_factor,
+        longtail_alpha=config.longtail_alpha,
+        longtail_shift=config.longtail_shift,
+    )
+    l_div = loss_diversity(audience_p, sigma=config.diversity_sigma)
+    return (
+        config.alpha_constraint * l_constraint
+        + config.beta_smooth * l_smooth
+        + config.gamma_corr * l_corr
+        + config.delta_reg * l_reg
+        + config.epsilon_diversity * l_div
+    )
+
+
 def optimize_audience_percent(
     judge_percents: List[float],
     eliminated_mask: List[bool],
@@ -173,7 +241,12 @@ def optimize_audience_percent(
             if name in prev_percent_map:
                 prev_percent_tensor[i] = float(prev_percent_map[name])
 
-    for _ in range(config.steps):
+    step_iter = (
+        trange(config.steps, desc="Optimize audience percents", leave=False)
+        if trange is not None
+        else range(config.steps)
+    )
+    for step_idx in step_iter:
         aud = torch.softmax(logits / config.temperature, dim=0)
         ranks = soft_rank(aud, tau=config.rank_tau)
 
@@ -190,17 +263,33 @@ def optimize_audience_percent(
             longtail_alpha=config.longtail_alpha,
             longtail_shift=config.longtail_shift,
         )
+        l_div = loss_diversity(aud, sigma=config.diversity_sigma)
 
         total = (
             config.alpha_constraint * l_constraint
             + config.beta_smooth * l_smooth
             + config.gamma_corr * l_corr
             + config.delta_reg * l_reg
+            + config.epsilon_diversity * l_div
         )
 
         opt.zero_grad(set_to_none=True)
         total.backward()
         opt.step()
+
+        if trange is not None and hasattr(step_iter, "set_postfix"):
+            if step_idx % 10 == 0 or step_idx == config.steps - 1:
+                step_iter.set_postfix(
+                    lr=f"{config.lr:.3g}",
+                    temp=f"{config.temperature:.3g}",
+                    tau=f"{config.rank_tau:.3g}",
+                    loss=f"{total.item():.4f}",
+                    c=f"{l_constraint.item():.4f}",
+                    s=f"{l_smooth.item():.4f}",
+                    corr=f"{l_corr.item():.4f}",
+                    reg=f"{l_reg.item():.4f}",
+                    div=f"{l_div.item():.4f}",
+                )
 
     with torch.no_grad():
         aud = torch.softmax(logits / config.temperature, dim=0)
@@ -238,18 +327,123 @@ def optimize_audience_percent(
             longtail_alpha=config.longtail_alpha,
             longtail_shift=config.longtail_shift,
         ).item()
+        l_div = loss_diversity(aud_t, sigma=config.diversity_sigma).item()
 
     loss_breakdown = {
         "constraint": l_constraint,
         "smooth": l_smooth,
         "corr": l_corr,
         "reg": l_reg,
+        "diversity": l_div,
         "total": (
             config.alpha_constraint * l_constraint
             + config.beta_smooth * l_smooth
             + config.gamma_corr * l_corr
             + config.delta_reg * l_reg
+            + config.epsilon_diversity * l_div
         ),
     }
 
     return aud_np, hard_ranks, loss_breakdown
+
+
+def optimize_audience_percent_ranges_loss_bounded(
+    judge_percents: List[float],
+    eliminated_mask: List[bool],
+    safe_mask: List[bool],
+    prev_percent_map: Dict[str, float],
+    participant_names: List[str],
+    config: PercentLossConfig,
+    base_audience_percents: np.ndarray,
+    min_total_loss: float,
+    loss_slack_ratio: float = 0.5,
+    steps: int = 250,
+    lr: float = None,
+    penalty_base: float = 50.0,
+    penalty_growth: float = 10.0,
+    attempts: int = 3,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Compute min/max audience percents for each participant while enforcing
+    total_loss <= min_total_loss * (1 + loss_slack_ratio).
+    Returns (min_percents, max_percents, loss_threshold).
+    """
+    _require_torch()
+
+    n = len(judge_percents)
+    if n == 0:
+        return np.array([]), np.array([]), 0.0
+
+    device = torch.device("cpu")
+    judge_p = torch.tensor(judge_percents, dtype=torch.float32, device=device)
+    elim_mask = torch.tensor(eliminated_mask, dtype=torch.bool, device=device)
+    safe_mask_t = torch.tensor(safe_mask, dtype=torch.bool, device=device)
+    prev_percent_tensor = _build_prev_percent_tensor(
+        participant_names=participant_names,
+        prev_percent_map=prev_percent_map,
+        device=device,
+    )
+
+    base_audience = np.clip(np.asarray(base_audience_percents, dtype=np.float64), 1e-8, 1.0)
+    base_audience = base_audience / base_audience.sum()
+    base_logits = np.log(base_audience)
+
+    loss_threshold = float(min_total_loss) * (1.0 + float(loss_slack_ratio))
+    lr = float(config.lr if lr is None else lr)
+
+    def _optimize_target(target_idx: int, direction: str) -> float:
+        best_val = None
+        best_violation = float("inf")
+
+        for attempt in range(attempts):
+            penalty = penalty_base * (penalty_growth ** attempt)
+            logits = torch.nn.Parameter(
+                torch.tensor(base_logits, dtype=torch.float32, device=device)
+            )
+            opt = torch.optim.Adam([logits], lr=lr)
+
+            for _ in range(steps):
+                aud = torch.softmax(logits / config.temperature, dim=0)
+                total_loss = _compute_total_loss(
+                    aud, judge_p, safe_mask_t, elim_mask, prev_percent_tensor, config
+                )
+                violation = torch.relu(total_loss - loss_threshold)
+                if direction == "min":
+                    obj = aud[target_idx] + penalty * violation
+                else:
+                    obj = -aud[target_idx] + penalty * violation
+
+                opt.zero_grad(set_to_none=True)
+                obj.backward()
+                opt.step()
+
+            with torch.no_grad():
+                aud = torch.softmax(logits / config.temperature, dim=0)
+                total_loss = _compute_total_loss(
+                    aud, judge_p, safe_mask_t, elim_mask, prev_percent_tensor, config
+                )
+                violation = max(0.0, total_loss.item() - loss_threshold)
+                candidate = aud[target_idx].item()
+
+            if violation <= 1e-6:
+                if best_val is None:
+                    best_val = candidate
+                else:
+                    if direction == "min":
+                        best_val = min(best_val, candidate)
+                    else:
+                        best_val = max(best_val, candidate)
+            elif violation < best_violation:
+                best_violation = violation
+                best_val = candidate
+
+        return float(best_val) if best_val is not None else float(base_audience[target_idx])
+
+    min_vals = np.zeros(n, dtype=float)
+    max_vals = np.zeros(n, dtype=float)
+    target_iter = trange(n, desc="Range opt", leave=False) if trange is not None else range(n)
+    for i in target_iter:
+        min_vals[i] = _optimize_target(i, "min")
+        max_vals[i] = _optimize_target(i, "max")
+
+    return min_vals, max_vals, loss_threshold

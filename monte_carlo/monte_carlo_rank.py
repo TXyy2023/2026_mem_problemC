@@ -7,7 +7,7 @@ import random
 # Configuration
 INPUT_FILE = '2026_MCM_Problem_C_Data.csv'
 OUTPUT_FILE = 'MCM_Problem_C_MonteCarlo_Results.csv'
-NUM_PARTICLES = 1000   # Number of particles (trajectories) per season
+NUM_PARTICLES = 10000   # Number of particles (trajectories) per season
 SEASONS_RANK = [1, 2] + list(range(28, 35)) # Assuming 34 is current max? Just simplified logic later.
 
 def load_data(filepath):

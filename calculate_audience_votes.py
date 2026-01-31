@@ -4,20 +4,29 @@ from scipy.optimize import linprog
 import warnings
 import re
 import os
+from datetime import datetime
 
-from percent_optimizer import PercentLossConfig, optimize_audience_percent
+from percent_optimizer import (
+    PercentLossConfig,
+    optimize_audience_percent,
+    optimize_audience_percent_ranges_loss_bounded,
+)
 
 warnings.filterwarnings('ignore')
 
-INPUT_FILE = '/Users/a1234/Desktop/美赛/2026_MCM_Problem_C_Data.csv'
-OUTPUT_FILE = '/Users/a1234/Desktop/美赛/MCM_Problem_C_Results.csv'
+INPUT_FILE = '2026_MCM_Problem_C_Data.csv'
+OUTPUT_PREFIX = 'MCM_Problem_C_Results'
+OUTPUT_BASE = f'{OUTPUT_PREFIX}.csv'
+OUTPUT_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M')
+OUTPUT_FILE = f'{OUTPUT_PREFIX}_{OUTPUT_TIMESTAMP}.csv'
 
 # Percent-rule optimization config (loss modularized in percent_optimizer.py)
 PERCENT_LOSS_CONFIG = PercentLossConfig(
     alpha_constraint=80.0,  # large penalty for violating elimination constraints
     beta_smooth=2.0,
-    gamma_corr=10.0,
+    gamma_corr=1.0,
     delta_reg=0.6,
+    epsilon_diversity=0.2,
     steps=700,
     lr=0.06,
     temperature=1.0,
@@ -27,6 +36,7 @@ PERCENT_LOSS_CONFIG = PercentLossConfig(
     longtail_alpha=1.5,
     longtail_shift=0.8,
     constraint_margin=0.0,
+    diversity_sigma=0.03,
 )
 
 def build_week_cols_map(score_cols):
@@ -373,7 +383,16 @@ def solve_percent_rule_inverse(target_p, participants):
         
     return max(0.0, min_val), min(100.0, max_val)
 
-def main(is_ml=True):
+def _select_prev_output_file():
+    candidates = []
+    for name in os.listdir('.'):
+        if name == OUTPUT_BASE or (name.startswith(f'{OUTPUT_PREFIX}_') and name.endswith('.csv')):
+            candidates.append(name)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: os.path.getmtime(p))
+
+def main(is_ml=True, is_percent_range=False):
     print(f"Loading data from {INPUT_FILE}...")
     df = pd.read_csv(INPUT_FILE)
     score_cols = [c for c in df.columns if 'judge' in c and 'score' in c and 'week' in c]
@@ -386,9 +405,10 @@ def main(is_ml=True):
     # Load prior ML outputs if needed
     prev_ml_map = {}
     if not is_ml:
-        if os.path.exists(OUTPUT_FILE):
+        prev_file = _select_prev_output_file()
+        if prev_file and os.path.exists(prev_file):
             try:
-                prev_df = pd.read_csv(OUTPUT_FILE)
+                prev_df = pd.read_csv(prev_file)
                 for _, row in prev_df.iterrows():
                     key = (row.get('CelebrityName'), int(row.get('Season')), int(row.get('Week')), row.get('RuleType'))
                     prev_ml_map[key] = {
@@ -399,11 +419,12 @@ def main(is_ml=True):
                         'Loss_Smooth': row.get('Loss_Smooth'),
                         'Loss_Corr': row.get('Loss_Corr'),
                         'Loss_Reg': row.get('Loss_Reg'),
+                        'Loss_Diversity': row.get('Loss_Diversity'),
                     }
             except Exception as e:
-                print(f"Warning: failed to read previous ML output from {OUTPUT_FILE}: {e}")
+                print(f"Warning: failed to read previous ML output from {prev_file}: {e}")
         else:
-            print(f"Warning: OUTPUT_FILE not found at {OUTPUT_FILE}; ML fields will be empty.")
+            print("Warning: no prior output file found; ML fields will be empty.")
 
     for season in seasons:
         # Determine Rule Type
@@ -434,7 +455,11 @@ def main(is_ml=True):
             week_aud_pcts = None
             week_aud_ranks = None
             week_loss = None
-            if rule_type == 'Percent' and is_ml:
+            week_range_min = None
+            week_range_max = None
+            prev_percent_map_for_week = prev_percent_map
+
+            if rule_type == 'Percent' and (is_ml or is_percent_range):
                 total_J = sum(p['total_score'] for p in participants)
                 judge_percents = [
                     (p['total_score'] / total_J) if total_J > 0 else 0.0
@@ -451,10 +476,23 @@ def main(is_ml=True):
                     judge_percents=judge_percents,
                     eliminated_mask=eliminated_mask,
                     safe_mask=safe_mask,
-                    prev_percent_map=prev_percent_map,
+                    prev_percent_map=prev_percent_map_for_week,
                     participant_names=names,
                     config=PERCENT_LOSS_CONFIG,
                 )
+
+                if is_percent_range and week_loss is not None:
+                    week_range_min, week_range_max, _ = optimize_audience_percent_ranges_loss_bounded(
+                        judge_percents=judge_percents,
+                        eliminated_mask=eliminated_mask,
+                        safe_mask=safe_mask,
+                        prev_percent_map=prev_percent_map_for_week,
+                        participant_names=names,
+                        config=PERCENT_LOSS_CONFIG,
+                        base_audience_percents=week_aud_pcts,
+                        min_total_loss=week_loss['total'],
+                        loss_slack_ratio=0.5,
+                    )
 
                 # Update previous week map for smoothness in next week
                 prev_percent_map = {
@@ -471,6 +509,7 @@ def main(is_ml=True):
                 loss_smooth = None
                 loss_corr = None
                 loss_reg = None
+                loss_diversity = None
                 
                 if rule_type == 'Rank':
                     min_r, max_r = solve_rank_rule_inverse(p, participants, n_p)
@@ -504,8 +543,13 @@ def main(is_ml=True):
                     j_norm = str(my_j)
                     
                 else:
-                    min_p, max_p = solve_percent_rule_inverse(p, participants)
-                    val_range = f"{min_p:.1f}%-{max_p:.1f}%"
+                    if is_percent_range and week_range_min is not None and week_range_max is not None:
+                        min_p = week_range_min[idx_p] * 100.0
+                        max_p = week_range_max[idx_p] * 100.0
+                        val_range = f"{min_p:.1f}%-{max_p:.1f}%"
+                    else:
+                        min_p, max_p = solve_percent_rule_inverse(p, participants)
+                        val_range = f"{min_p:.1f}%-{max_p:.1f}%"
                     total_s = sum(x['total_score'] for x in participants)
                     j_p = (p['total_score'] / total_s) * 100 if total_s > 0 else 0
                     j_norm = f"{j_p:.1f}%"
@@ -520,6 +564,7 @@ def main(is_ml=True):
                             loss_smooth = float(week_loss['smooth'])
                             loss_corr = float(week_loss['corr'])
                             loss_reg = float(week_loss['reg'])
+                            loss_diversity = float(week_loss['diversity'])
                     elif not is_ml:
                         key = (p['name'], int(season), int(week), rule_type)
                         cached = prev_ml_map.get(key)
@@ -531,6 +576,7 @@ def main(is_ml=True):
                             loss_smooth = cached.get('Loss_Smooth')
                             loss_corr = cached.get('Loss_Corr')
                             loss_reg = cached.get('Loss_Reg')
+                            loss_diversity = cached.get('Loss_Diversity')
                 
                 status_out = 'Safe'
                 if p['status'] == 'Withdrew':
@@ -556,10 +602,32 @@ def main(is_ml=True):
                     'Loss_Smooth': loss_smooth,
                     'Loss_Corr': loss_corr,
                     'Loss_Reg': loss_reg,
+                    'Loss_Diversity': loss_diversity,
                     'Status': status_out
                 })
                 
     out_df = pd.DataFrame(results)
+    if is_ml:
+        config_payload = {
+            'alpha_constraint': PERCENT_LOSS_CONFIG.alpha_constraint,
+            'beta_smooth': PERCENT_LOSS_CONFIG.beta_smooth,
+            'gamma_corr': PERCENT_LOSS_CONFIG.gamma_corr,
+            'delta_reg': PERCENT_LOSS_CONFIG.delta_reg,
+            'epsilon_diversity': PERCENT_LOSS_CONFIG.epsilon_diversity,
+            'steps': PERCENT_LOSS_CONFIG.steps,
+            'lr': PERCENT_LOSS_CONFIG.lr,
+            'temperature': PERCENT_LOSS_CONFIG.temperature,
+            'rank_tau': PERCENT_LOSS_CONFIG.rank_tau,
+            'reg_type': PERCENT_LOSS_CONFIG.reg_type,
+            'normal_sigma_factor': PERCENT_LOSS_CONFIG.normal_sigma_factor,
+            'longtail_alpha': PERCENT_LOSS_CONFIG.longtail_alpha,
+            'longtail_shift': PERCENT_LOSS_CONFIG.longtail_shift,
+            'constraint_margin': PERCENT_LOSS_CONFIG.constraint_margin,
+            'diversity_sigma': PERCENT_LOSS_CONFIG.diversity_sigma,
+        }
+        for key, value in config_payload.items():
+            out_df[f'Config_{key}'] = value
+        print("PercentLossConfig:", config_payload)
     out_df.to_csv(OUTPUT_FILE, index=False)
     print(f"Results saved to {OUTPUT_FILE}")
 
@@ -567,7 +635,10 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description="Calculate audience vote ranges.")
     parser.add_argument('--is-ml', dest='is_ml', action='store_true', help='Run ML optimization for percent rule.')
-    parser.add_argument('--no-ml', dest='is_ml', action='store_false', help='Reuse ML outputs from OUTPUT_FILE.')
+    parser.add_argument('--no-ml', dest='is_ml', action='store_false', help='Reuse ML outputs from latest output file.')
+    parser.add_argument('--percent-range', dest='is_percent_range', action='store_true', help='Use loss-bounded percent ranges.')
+    parser.add_argument('--no-percent-range', dest='is_percent_range', action='store_false', help='Use elimination-only percent ranges.')
     parser.set_defaults(is_ml=True)
+    parser.set_defaults(is_percent_range=True)
     args = parser.parse_args()
-    main(is_ml=bool(args.is_ml))
+    main(is_ml=bool(args.is_ml), is_percent_range=bool(args.is_percent_range))
