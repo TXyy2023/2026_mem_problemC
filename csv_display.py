@@ -72,6 +72,78 @@ def parse_range(range_str):
             return None, None
     return None, None
 
+def _render_variable_guide(results_df: pd.DataFrame, mc_df: pd.DataFrame, original_df: pd.DataFrame):
+    st.caption("不同表格的字段含义如下（根据当前数据列动态展示）。")
+
+    results_desc = {
+        "CelebrityName": "选手姓名",
+        "Season": "赛季编号",
+        "Week": "周次",
+        "RuleType": "规则类型（Rank=观众投票按排名，Percent=观众投票按百分比）",
+        "JudgeScore": "该周评委总分",
+        "JudgeScore_Normalization": "评委分数的规范化结果（排名/百分比）",
+        "Possible_Audience_Vote_Range": "观众投票可能范围（排名区间或百分比区间）",
+        "Predicted_Audience_Percent": "模型预测的观众投票百分比",
+        "Predicted_Audience_Rank": "模型预测的观众投票排名",
+        "Loss_Total": "优化总损失",
+        "Loss_Constraint": "约束损失",
+        "Loss_Smooth": "平滑损失",
+        "Loss_Corr": "相关性损失",
+        "Loss_Reg": "正则化损失",
+        "Status": "当周状态（Safe/Eliminated 等）",
+    }
+
+    mc_desc = {
+        "Season": "赛季编号",
+        "Week": "周次",
+        "CelebrityName": "选手姓名",
+        "Mean_Rank": "蒙特卡洛估计的平均排名",
+        "Min_Rank": "模拟中的最小排名",
+        "Max_Rank": "模拟中的最大排名",
+        "CI_Lower": "排名置信区间下界",
+        "CI_Upper": "排名置信区间上界",
+        "Status": "当周状态（Safe/Eliminated 等）",
+        "RuleType": "规则类型（Rank/Percent）",
+    }
+
+    original_desc = {
+        "celebrity_name": "选手姓名",
+        "ballroom_partner": "舞伴姓名",
+        "celebrity_industry": "选手行业/职业",
+        "celebrity_homestate": "选手家乡州/省",
+        "celebrity_homecountry/region": "选手家乡国家/地区",
+        "celebrity_age_during_season": "赛季期间年龄",
+        "season": "赛季编号",
+        "results": "赛季最终结果/名次描述",
+        "placement": "赛季最终名次（数字）",
+    }
+
+    def render_table(df: pd.DataFrame, desc_map: dict, title: str):
+        st.subheader(title)
+        if df.empty:
+            st.info("暂无数据可展示。")
+            return
+        rows = []
+        for col in df.columns:
+            if col in desc_map:
+                desc = desc_map[col]
+            else:
+                m = re.match(r"week(\\d+)_judge(\\d+)_score", str(col))
+                if m:
+                    desc = f"第{m.group(1)}周评委{m.group(2)}打分"
+                else:
+                    desc = "（新增字段）请根据数据含义补充说明"
+            rows.append({"字段": col, "说明": desc})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    tabs = st.tabs(["Calculated Results", "Monte Carlo", "Original Data"])
+    with tabs[0]:
+        render_table(results_df, results_desc, "Calculated Results 字段")
+    with tabs[1]:
+        render_table(mc_df, mc_desc, "Monte Carlo 字段")
+    with tabs[2]:
+        render_table(original_df, original_desc, "Original Data 字段")
+
 def main():
     st.title("MCM Problem C - Analysis Dashboard")
     
@@ -80,6 +152,9 @@ def main():
     except Exception as e:
         st.error(f"Error loading data: {e}")
         return
+
+    with st.expander("变量说明", expanded=False):
+        _render_variable_guide(results_df, mc_df, original_df)
 
     # Sidebar
     st.sidebar.header("Filter Options")
