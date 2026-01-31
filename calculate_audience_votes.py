@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from scipy.optimize import linprog
 import warnings
 import re
 import os
@@ -14,7 +13,6 @@ except Exception:
 from percent_optimizer import (
     PercentLossConfig,
     optimize_audience_percent,
-    optimize_audience_percent_ranges_loss_bounded,
 )
 
 warnings.filterwarnings('ignore')
@@ -310,85 +308,6 @@ def solve_rank_rule_inverse(target_p, participants, n_participants):
         
     return min(valid_a), max(valid_a)
 
-def solve_percent_rule_inverse(target_p, participants):
-    """
-    Linear Programming for Percent Rule.
-    Vars: x_1 ... x_n (Audience Percentages).
-    Target: Min/Max x_target.
-    Constraints:
-    1. Sum(x) = 1.
-    2. x >= 0.
-    3. For all s in S, e in E: Total(s) >= Total(e).
-       (J_s + x_s) >= (J_e + x_e)
-       x_s - x_e >= J_e - J_s
-    """
-    S = [p for p in participants if not p['is_eliminated_this_week'] and p['status'] != 'Withdrew']
-    E = [p for p in participants if p['is_eliminated_this_week']]
-    
-    if not E:
-        return 0.0, 100.0
-        
-    n = len(participants)
-    target_idx = participants.index(target_p)
-    
-    # Vars: x_0 ... x_{n-1}
-    # Bounds: (0, 1)
-    bounds = [(0, 1) for _ in range(n)]
-    
-    # Equality: Sum(x) = 1
-    # A_eq * x = b_eq
-    A_eq = [[1.0] * n]
-    b_eq = [1.0]
-    
-    # Inequality: A_ub * x <= b_ub
-    # SciPy uses <=.
-    # Constraint: x_s - x_e >= val  =>  x_e - x_s <= -val
-    
-    A_ub = []
-    b_ub = []
-    
-    # Calculate Judge Percentages
-    total_J = sum(p['total_score'] for p in participants)
-    J_percents = [p['total_score']/total_J for p in participants]
-    
-    s_indices = [participants.index(p) for p in S]
-    e_indices = [participants.index(p) for p in E]
-    
-    for s_i in s_indices:
-        for e_i in e_indices:
-            # x_e - x_s <= J_s - J_e
-            # Row vector
-            row = [0] * n
-            row[e_i] = 1
-            row[s_i] = -1
-            A_ub.append(row)
-            b_ub.append(J_percents[s_i] - J_percents[e_i])
-            
-    # Create valid LP?
-    # If S and E empty? Handled.
-    
-    # Solve Min
-    c_min = [0] * n
-    c_min[target_idx] = 1 # Minimize target
-    
-    res_min = linprog(c_min, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-    
-    # Solve Max
-    c_max = [0] * n
-    c_max[target_idx] = -1 # Maximize target
-    
-    res_max = linprog(c_max, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-    
-    min_val = 0.0
-    max_val = 100.0
-    
-    if res_min.success:
-        min_val = res_min.fun * 100
-    if res_max.success:
-        max_val = -res_max.fun * 100
-        
-    return max(0.0, min_val), min(100.0, max_val)
-
 def _select_prev_output_file():
     candidates = []
     for name in os.listdir('.'):
@@ -398,7 +317,7 @@ def _select_prev_output_file():
         return None
     return max(candidates, key=lambda p: os.path.getmtime(p))
 
-def main(is_ml=True, is_percent_range=False, loss_threshold_multiplier=1.5):
+def main(is_ml=True):
     print(f"Loading data from {INPUT_FILE}...")
     df = pd.read_csv(INPUT_FILE)
     score_cols = [c for c in df.columns if 'judge' in c and 'score' in c and 'week' in c]
@@ -476,11 +395,9 @@ def main(is_ml=True, is_percent_range=False, loss_threshold_multiplier=1.5):
             week_aud_pcts = None
             week_aud_ranks = None
             week_loss = None
-            week_range_min = None
-            week_range_max = None
             prev_percent_map_for_week = prev_percent_map
 
-            if rule_type == 'Percent' and (is_ml or is_percent_range):
+            if rule_type == 'Percent' and is_ml:
                 total_J = sum(p['total_score'] for p in participants)
                 judge_percents = [
                     (p['total_score'] / total_J) if total_J > 0 else 0.0
@@ -501,19 +418,6 @@ def main(is_ml=True, is_percent_range=False, loss_threshold_multiplier=1.5):
                     participant_names=names,
                     config=PERCENT_LOSS_CONFIG,
                 )
-
-                if is_percent_range and week_loss is not None:
-                    week_range_min, week_range_max, _ = optimize_audience_percent_ranges_loss_bounded(
-                        judge_percents=judge_percents,
-                        eliminated_mask=eliminated_mask,
-                        safe_mask=safe_mask,
-                        prev_percent_map=prev_percent_map_for_week,
-                        participant_names=names,
-                        config=PERCENT_LOSS_CONFIG,
-                        base_audience_percents=week_aud_pcts,
-                        min_total_loss=week_loss['total'],
-                        loss_threshold_multiplier=loss_threshold_multiplier,
-                    )
 
                 # Update previous week map for smoothness in next week
                 prev_percent_map = {
@@ -564,13 +468,7 @@ def main(is_ml=True, is_percent_range=False, loss_threshold_multiplier=1.5):
                     j_norm = str(my_j)
                     
                 else:
-                    if is_percent_range and week_range_min is not None and week_range_max is not None:
-                        min_p = week_range_min[idx_p] * 100.0
-                        max_p = week_range_max[idx_p] * 100.0
-                        val_range = f"{min_p:.1f}%-{max_p:.1f}%"
-                    else:
-                        min_p, max_p = solve_percent_rule_inverse(p, participants)
-                        val_range = f"{min_p:.1f}%-{max_p:.1f}%"
+                    val_range = ""
                     total_s = sum(x['total_score'] for x in participants)
                     j_p = (p['total_score'] / total_s) * 100 if total_s > 0 else 0
                     j_norm = f"{j_p:.1f}%"
@@ -661,20 +559,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Calculate audience vote ranges.")
     parser.add_argument('--is-ml', dest='is_ml', action='store_true', help='Run ML optimization for percent rule.')
     parser.add_argument('--no-ml', dest='is_ml', action='store_false', help='Reuse ML outputs from latest output file.')
-    parser.add_argument('--percent-range', dest='is_percent_range', action='store_true', help='Use loss-bounded percent ranges.')
-    parser.add_argument('--no-percent-range', dest='is_percent_range', action='store_false', help='Use elimination-only percent ranges.')
-    parser.add_argument(
-        '--loss-threshold-multiplier',
-        dest='loss_threshold_multiplier',
-        type=float,
-        default=1,
-        help='Loss threshold multiplier for loss-bounded percent ranges (e.g., 1.5 = 150%).',
-    )
     parser.set_defaults(is_ml=True)
-    parser.set_defaults(is_percent_range=True)
     args = parser.parse_args()
     main(
         is_ml=bool(args.is_ml),
-        is_percent_range=bool(args.is_percent_range),
-        loss_threshold_multiplier=float(args.loss_threshold_multiplier),
     )
