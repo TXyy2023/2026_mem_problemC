@@ -72,9 +72,10 @@ def main(ml_input: str = None, loss_threshold_multiplier: float = 1.5):
             except Exception:
                 pass
         sorted_weeks = sorted(list(weeks))
+        last_week = sorted_weeks[-1] if sorted_weeks else None
 
         for week in sorted_weeks:
-            participants = get_weekly_participants(df, season, week, score_cols)
+            participants = get_weekly_participants(df, season, week, score_cols, last_week)
             if not participants:
                 continue
 

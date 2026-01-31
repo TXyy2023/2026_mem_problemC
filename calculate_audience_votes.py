@@ -113,7 +113,7 @@ def parse_result_status(df, score_cols):
             
     return df
 
-def get_weekly_participants(df, season, week, score_cols):
+def get_weekly_participants(df, season, week, score_cols, last_week):
     """
     Get participants who danced this week.
     Returns list of dicts with info.
@@ -164,7 +164,7 @@ def get_weekly_participants(df, season, week, score_cols):
             
             is_eliminated = (p_data['exit_week'] == week and p_data['status'] == 'Eliminated')
             # Check for finalists outcome
-            if 'place' in str(p_data['actual_result']).lower() and week == sorted_weeks[-1]:
+            if 'place' in str(p_data['actual_result']).lower() and week == last_week:
                  # Final week logic
                  pass
             
@@ -330,9 +330,10 @@ def _process_season(
         except Exception:
             pass
     sorted_weeks = sorted(list(weeks))
+    last_week = sorted_weeks[-1] if sorted_weeks else None
 
     for week in sorted_weeks:
-        participants = get_weekly_participants(df, season, week, score_cols)
+        participants = get_weekly_participants(df, season, week, score_cols, last_week)
         if not participants:
             continue
 
@@ -460,7 +461,6 @@ def main(is_ml=True, season_workers: int = 1):
     seasons = sorted(df['season'].unique())
     
     results = []
-    global sorted_weeks # Hack for global access in get_participants
     
     total_weeks = 0
     for season in seasons:
