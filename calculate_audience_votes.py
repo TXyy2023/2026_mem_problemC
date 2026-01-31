@@ -4,10 +4,29 @@ from scipy.optimize import linprog
 import warnings
 import re
 
+from percent_optimizer import PercentLossConfig, optimize_audience_percent
+
 warnings.filterwarnings('ignore')
 
 INPUT_FILE = '/Users/a1234/Desktop/美赛/2026_MCM_Problem_C_Data.csv'
 OUTPUT_FILE = '/Users/a1234/Desktop/美赛/MCM_Problem_C_Results.csv'
+
+# Percent-rule optimization config (loss modularized in percent_optimizer.py)
+PERCENT_LOSS_CONFIG = PercentLossConfig(
+    alpha_constraint=80.0,  # large penalty for violating elimination constraints
+    beta_smooth=2.0,
+    gamma_corr=1.0,
+    delta_reg=0.6,
+    steps=700,
+    lr=0.06,
+    temperature=1.0,
+    rank_tau=0.45,
+    reg_type="longtail",
+    normal_sigma_factor=0.28,
+    longtail_alpha=1.5,
+    longtail_shift=0.8,
+    constraint_margin=0.0,
+)
 
 def parse_result_status(df):
     """
@@ -324,6 +343,8 @@ def main():
         rule_type = 'Percent'
         if season <= 2 or season >= 28:
             rule_type = 'Rank'
+
+        prev_percent_map = {}
             
         # Get weeks
         weeks = set()
@@ -341,10 +362,48 @@ def main():
                 continue
                 
             n_p = len(participants)
+
+            # Percent rule optimization (backprop) computed once per week
+            week_aud_pcts = None
+            week_aud_ranks = None
+            week_loss = None
+            if rule_type == 'Percent':
+                total_J = sum(p['total_score'] for p in participants)
+                judge_percents = [
+                    (p['total_score'] / total_J) if total_J > 0 else 0.0
+                    for p in participants
+                ]
+                eliminated_mask = [p['is_eliminated_this_week'] for p in participants]
+                safe_mask = [
+                    (not p['is_eliminated_this_week']) and p['status'] != 'Withdrew'
+                    for p in participants
+                ]
+                names = [p['name'] for p in participants]
+
+                week_aud_pcts, week_aud_ranks, week_loss = optimize_audience_percent(
+                    judge_percents=judge_percents,
+                    eliminated_mask=eliminated_mask,
+                    safe_mask=safe_mask,
+                    prev_percent_map=prev_percent_map,
+                    participant_names=names,
+                    config=PERCENT_LOSS_CONFIG,
+                )
+
+                # Update previous week map for smoothness in next week
+                prev_percent_map = {
+                    names[i]: float(week_aud_pcts[i]) for i in range(len(names))
+                }
             
-            for p in participants:
+            for idx_p, p in enumerate(participants):
                 val_range = ""
                 j_norm = ""
+                pred_aud_pct = None
+                pred_aud_rank = None
+                loss_total = None
+                loss_constraint = None
+                loss_smooth = None
+                loss_corr = None
+                loss_reg = None
                 
                 if rule_type == 'Rank':
                     min_r, max_r = solve_rank_rule_inverse(p, participants, n_p)
@@ -383,6 +442,17 @@ def main():
                     total_s = sum(x['total_score'] for x in participants)
                     j_p = (p['total_score'] / total_s) * 100 if total_s > 0 else 0
                     j_norm = f"{j_p:.1f}%"
+
+                    # Predicted audience percent/rank from backprop optimization
+                    if week_aud_pcts is not None:
+                        pred_aud_pct = float(week_aud_pcts[idx_p] * 100.0)
+                        pred_aud_rank = int(round(week_aud_ranks[idx_p]))
+                        if week_loss is not None:
+                            loss_total = float(week_loss['total'])
+                            loss_constraint = float(week_loss['constraint'])
+                            loss_smooth = float(week_loss['smooth'])
+                            loss_corr = float(week_loss['corr'])
+                            loss_reg = float(week_loss['reg'])
                 
                 results.append({
                     'CelebrityName': p['name'],
@@ -392,6 +462,13 @@ def main():
                     'JudgeScore': p['total_score'],
                     'JudgeScore_Normalization': j_norm,
                     'Possible_Audience_Vote_Range': val_range,
+                    'Predicted_Audience_Percent': pred_aud_pct,
+                    'Predicted_Audience_Rank': pred_aud_rank,
+                    'Loss_Total': loss_total,
+                    'Loss_Constraint': loss_constraint,
+                    'Loss_Smooth': loss_smooth,
+                    'Loss_Corr': loss_corr,
+                    'Loss_Reg': loss_reg,
                     'Status': p['status'] if p['is_eliminated_this_week'] else 'Safe'
                 })
                 
