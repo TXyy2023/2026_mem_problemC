@@ -23,11 +23,11 @@ OUTPUT_FILE = f'{OUTPUT_PREFIX}_{OUTPUT_TIMESTAMP}.csv'
 
 # Percent-rule optimization config (loss modularized in percent_optimizer.py)
 PERCENT_LOSS_CONFIG = PercentLossConfig(
-    alpha_constraint=120.0,  # large penalty for violating elimination constraints
-    beta_smooth=4.0,
-    gamma_corr=2.0,
-    delta_reg=1,
-    epsilon_diversity=1,
+    alpha_constraint=240.0,  # large penalty for violating elimination constraints
+    beta_smooth=6.0,
+    gamma_corr=5.0,
+    delta_reg=5,
+    epsilon_diversity=5,
     steps=2000,
     lr=0.005,
     temperature=0.8,
@@ -461,6 +461,7 @@ def main(is_ml=True, season_workers: int = 1):
     seasons = sorted(df['season'].unique())
     
     results = []
+    global sorted_weeks # Hack for global access in get_participants
     
     total_weeks = 0
     for season in seasons:

@@ -12,7 +12,7 @@ st.set_page_config(layout="wide", page_title="MCM Results Viewer")
 # File Paths
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_FILE = BASE_DIR / 'MCM_Problem_C_Results.csv'
-MC_RESULTS_FILE = BASE_DIR / 'MCM_Problem_C_MonteCarlo_Results.csv'
+MC_RESULTS_FILE = BASE_DIR / 'MCM_Problem_C_Results_20260131_2256.csv'
 # Original data might be useful, but let's stick to Results for now as requested for "calculated data"
 # We can load original for extra context if needed, but the user focused on the output tables.
 # User said "Show two tables", implies Result and Original?
