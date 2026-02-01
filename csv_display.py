@@ -440,8 +440,8 @@ def _render_variable_guide(
     with tabs[2]:
         render_table(original_df, original_desc, "Original Data 字段")
     with tabs[3]:
-        diff_df = extra_tables.get("diff_summary", pd.DataFrame())
-        render_table(diff_df, diff_desc, "diff_summary 字段")
+        diff_df = extra_tables.get("rank_percent_diff_summary", pd.DataFrame())
+        render_table(diff_df, diff_desc, "rank_percent_diff_summary 字段")
     with tabs[4]:
         rp_df = extra_tables.get("MCM_Problem_C_Results_20260201_1748_uncertainty", pd.DataFrame())
         render_table(rp_df, rank_percent_diff_desc, "uncertainty 字段")
