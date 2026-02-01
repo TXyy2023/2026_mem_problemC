@@ -12,6 +12,8 @@ from calculate_audience_votes import (
     OUTPUT_PREFIX,
     PERCENT_LOSS_CONFIG,
     get_weekly_participants,
+    load_search_trend_map,
+    _normalize_name,
     parse_result_status,
 )
 from percent_optimizer import optimize_audience_percent_ranges_loss_bounded
@@ -57,6 +59,7 @@ def _process_season_percent_range(
     score_cols: list,
     ml_map: dict,
     loss_threshold_multiplier: float,
+    trend_map: dict,
     show_week_progress: bool = False,
 ) -> dict:
     rule_type = "Percent"
@@ -97,6 +100,12 @@ def _process_season_percent_range(
             for p in participants
         ]
         names = [p["name"] for p in participants]
+        trend_scores = None
+        if trend_map:
+            trend_scores = [
+                trend_map.get((season, _normalize_name(name)), float("nan"))
+                for name in names
+            ]
 
         # Build base audience percents and loss from ML outputs
         base_audience = []
@@ -128,6 +137,7 @@ def _process_season_percent_range(
             safe_mask=safe_mask,
             prev_percent_map=prev_percent_map,
             participant_names=names,
+            trend_scores=trend_scores,
             config=PERCENT_LOSS_CONFIG,
             base_audience_percents=base_audience,
             min_total_loss=week_loss_total,
@@ -159,6 +169,7 @@ def main(
     df = pd.read_csv(INPUT_FILE)
     score_cols = [c for c in df.columns if "judge" in c and "score" in c and "week" in c]
     df = parse_result_status(df, score_cols)
+    trend_map = load_search_trend_map()
 
     print(f"Loading ML output from {ml_input}...")
     ml_df = pd.read_csv(ml_input)
@@ -192,6 +203,7 @@ def main(
                 score_cols=score_cols,
                 ml_map=ml_map,
                 loss_threshold_multiplier=loss_threshold_multiplier,
+                trend_map=trend_map,
                 show_week_progress=True,
             )
             range_map.update(season_map)
@@ -207,6 +219,7 @@ def main(
                     score_cols,
                     ml_map,
                     loss_threshold_multiplier,
+                    trend_map,
                 ): season
                 for season in seasons
             }

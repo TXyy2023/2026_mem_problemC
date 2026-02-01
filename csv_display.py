@@ -90,6 +90,8 @@ def _render_variable_guide(results_df: pd.DataFrame, mc_df: pd.DataFrame, origin
         "Loss_Smooth": "平滑损失",
         "Loss_Corr": "相关性损失",
         "Loss_Reg": "正则化损失",
+        "Loss_Diversity": "多样性损失",
+        "Loss_Trend": "搜索热度损失",
         "Status": "当周状态（Safe/Eliminated 等）",
     }
 

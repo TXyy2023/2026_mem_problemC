@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import warnings
@@ -17,6 +18,7 @@ from percent_optimizer import (
 warnings.filterwarnings('ignore')
 
 INPUT_FILE = '2026_MCM_Problem_C_Data.csv'
+SEARCH_TREND_FILE = 'search_trend.csv'
 OUTPUT_PREFIX = 'MCM_Problem_C_Results'
 OUTPUT_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M')
 OUTPUT_FILE = f'{OUTPUT_PREFIX}_{OUTPUT_TIMESTAMP}.csv'
@@ -24,10 +26,11 @@ OUTPUT_FILE = f'{OUTPUT_PREFIX}_{OUTPUT_TIMESTAMP}.csv'
 # Percent-rule optimization config (loss modularized in percent_optimizer.py)
 PERCENT_LOSS_CONFIG = PercentLossConfig(
     alpha_constraint=240.0,  # large penalty for violating elimination constraints
-    beta_smooth=6.0,
+    beta_smooth=3.0,
     gamma_corr=5.0,
-    delta_reg=5,
-    epsilon_diversity=5,
+    delta_reg=2,
+    epsilon_diversity=4,
+    zeta_trend=5.0,
     steps=2000,
     lr=0.005,
     temperature=0.8,
@@ -40,6 +43,55 @@ PERCENT_LOSS_CONFIG = PercentLossConfig(
     diversity_sigma=0.03,
     device="cuda",
 )
+
+
+def _normalize_name(name: str) -> str:
+    if name is None:
+        return ""
+    return re.sub(r"\s+", " ", str(name)).strip().casefold()
+
+
+def _resolve_col(df: pd.DataFrame, candidates: list) -> str:
+    lower_map = {c.casefold(): c for c in df.columns}
+    for cand in candidates:
+        if cand in df.columns:
+            return cand
+        if cand.casefold() in lower_map:
+            return lower_map[cand.casefold()]
+    return ""
+
+
+def load_search_trend_map(path: str = SEARCH_TREND_FILE) -> dict:
+    if not os.path.exists(path):
+        print(f"Warning: search trend file not found: {path}. Trend loss disabled.")
+        return {}
+    trend_df = pd.read_csv(path, encoding="utf-8-sig")
+    season_col = _resolve_col(trend_df, ["season"])
+    name_col = _resolve_col(trend_df, ["celebrity_name"])
+    trend_col = _resolve_col(trend_df, ["relative_interest"])
+    if not season_col or not name_col or not trend_col:
+        print("Warning: search trend file missing required columns. Trend loss disabled.")
+        return {}
+    trend_map = {}
+    for _, row in trend_df.iterrows():
+        try:
+            season = int(float(row.get(season_col)))
+        except Exception:
+            continue
+        name = _normalize_name(row.get(name_col))
+        if not name:
+            continue
+        val = row.get(trend_col)
+        try:
+            val = float(val)
+        except Exception:
+            continue
+        if pd.isna(val):
+            continue
+        key = (season, name)
+        if key not in trend_map or val > trend_map[key]:
+            trend_map[key] = val
+    return trend_map
 
 def build_week_cols_map(score_cols):
     week_cols_map = {}
@@ -311,6 +363,7 @@ def _process_season(
     df: pd.DataFrame,
     score_cols: list,
     is_ml: bool,
+    trend_map: dict,
 ):
     results = []
 
@@ -357,6 +410,12 @@ def _process_season(
                 for p in participants
             ]
             names = [p['name'] for p in participants]
+            trend_scores = None
+            if trend_map:
+                trend_scores = [
+                    trend_map.get((season, _normalize_name(name)), float("nan"))
+                    for name in names
+                ]
 
             week_aud_pcts, week_aud_ranks, week_loss = optimize_audience_percent(
                 judge_percents=judge_percents,
@@ -364,6 +423,7 @@ def _process_season(
                 safe_mask=safe_mask,
                 prev_percent_map=prev_percent_map_for_week,
                 participant_names=names,
+                trend_scores=trend_scores,
                 config=PERCENT_LOSS_CONFIG,
             )
 
@@ -383,6 +443,7 @@ def _process_season(
             loss_corr = None
             loss_reg = None
             loss_diversity = None
+            loss_trend = None
 
             if rule_type == 'Rank':
                 min_r, max_r = solve_rank_rule_inverse(p, participants, n_p)
@@ -421,6 +482,7 @@ def _process_season(
                         loss_corr = float(week_loss['corr'])
                         loss_reg = float(week_loss['reg'])
                         loss_diversity = float(week_loss['diversity'])
+                        loss_trend = float(week_loss['trend'])
 
             status_out = 'Safe'
             if p['status'] == 'Withdrew':
@@ -447,6 +509,7 @@ def _process_season(
                 'Loss_Corr': loss_corr,
                 'Loss_Reg': loss_reg,
                 'Loss_Diversity': loss_diversity,
+                'Loss_Trend': loss_trend,
                 'Status': status_out
             })
 
@@ -458,6 +521,7 @@ def main(is_ml=True, season_workers: int = 1):
     df = pd.read_csv(INPUT_FILE)
     score_cols = [c for c in df.columns if 'judge' in c and 'score' in c and 'week' in c]
     df = parse_result_status(df, score_cols)
+    trend_map = load_search_trend_map()
     seasons = sorted(df['season'].unique())
     
     results = []
@@ -481,7 +545,7 @@ def main(is_ml=True, season_workers: int = 1):
 
     if season_workers == 1:
         for season in seasons:
-            results.extend(_process_season(season, df, score_cols, is_ml))
+            results.extend(_process_season(season, df, score_cols, is_ml, trend_map))
             if week_progress is not None:
                 # Approximate progress: mark all weeks for this season as done.
                 season_weeks = set()
@@ -497,7 +561,7 @@ def main(is_ml=True, season_workers: int = 1):
 
         with ProcessPoolExecutor(max_workers=int(season_workers)) as ex:
             futures = {
-                ex.submit(_process_season, season, df, score_cols, is_ml): season
+                ex.submit(_process_season, season, df, score_cols, is_ml, trend_map): season
                 for season in seasons
             }
             for fut in as_completed(futures):
@@ -522,6 +586,7 @@ def main(is_ml=True, season_workers: int = 1):
             'gamma_corr': PERCENT_LOSS_CONFIG.gamma_corr,
             'delta_reg': PERCENT_LOSS_CONFIG.delta_reg,
             'epsilon_diversity': PERCENT_LOSS_CONFIG.epsilon_diversity,
+            'zeta_trend': PERCENT_LOSS_CONFIG.zeta_trend,
             'steps': PERCENT_LOSS_CONFIG.steps,
             'lr': PERCENT_LOSS_CONFIG.lr,
             'temperature': PERCENT_LOSS_CONFIG.temperature,

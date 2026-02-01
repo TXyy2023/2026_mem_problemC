@@ -4,7 +4,7 @@ import os
 import pandas as pd
 
 DEFAULT_MC_INPUT = 'MCM_Problem_C_MonteCarlo_Results.csv'
-DEFAULT_RESULT_DATA = 'MCM_Problem_C_Results_20260131_1700.csv'
+DEFAULT_RESULT_DATA = 'MCM_Problem_C_Results_20260201_1348.csv'
 
 
 def rank_to_percent(rank, n):

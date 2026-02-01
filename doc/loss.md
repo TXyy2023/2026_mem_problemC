@@ -3,7 +3,7 @@
 本项目对观众投票百分比 `audience_p` 进行反向传播优化，单周总损失为加权和：
 
 ```
-L_total = α * L_constraint + β * L_smooth + γ * L_corr + δ * L_reg
+L_total = α * L_constraint + β * L_smooth + γ * L_corr + δ * L_reg + ε * L_diversity + ζ * L_trend
 ```
 
 其中权重来自 `PercentLossConfig`：
@@ -12,6 +12,8 @@ L_total = α * L_constraint + β * L_smooth + γ * L_corr + δ * L_reg
 - β = `beta_smooth`
 - γ = `gamma_corr`
 - δ = `delta_reg`
+- ε = `epsilon_diversity`
+- ζ = `zeta_trend`
 
 下文给出各项损失的具体计算方式（见 `percent_optimizer.py`）。
 
@@ -123,4 +125,22 @@ L_total = alpha_constraint * L_constraint
         + gamma_corr * L_corr
         + delta_reg * L_reg
         + epsilon_diversity * L_diversity
+        + zeta_trend * L_trend
 ```
+
+## 6. Trend loss L_trend (search interest)
+
+目的：搜索热度与观众投票正相关；让观众百分比与搜索热度方向一致。
+
+定义：
+
+- `trend_scores` 为该周参赛选手的搜索热度（来自 `search_trend.csv`）
+- 对缺失值用 NaN 占位并忽略
+
+计算（相关系数损失）：
+```
+corr = mean((a - mean(a)) * (t - mean(t))) / (std(a) * std(t) + 1e-12)
+L_trend = 1 - corr
+```
+
+其中 `a = audience_p`，`t = trend_scores`；当有效样本数 < 2 或标准差过小，返回 0。

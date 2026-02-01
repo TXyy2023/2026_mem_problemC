@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
@@ -25,6 +25,7 @@ class PercentLossConfig:
     gamma_corr: float = 1.0
     delta_reg: float = 0.5
     epsilon_diversity: float = 0.05
+    zeta_trend: float = 1.0
 
     # Optimization
     steps: int = 600
@@ -166,6 +167,29 @@ def loss_corr(audience_p: "torch.Tensor", judge_p: "torch.Tensor") -> "torch.Ten
     return 1.0 - corr
 
 
+def loss_trend(
+    audience_p: "torch.Tensor", trend_scores: Optional["torch.Tensor"]
+) -> "torch.Tensor":
+    if trend_scores is None or trend_scores.numel() == 0:
+        return torch.tensor(0.0, device=audience_p.device)
+    if trend_scores.numel() != audience_p.numel():
+        return torch.tensor(0.0, device=audience_p.device)
+    mask = torch.isfinite(trend_scores)
+    if mask.sum() < 2:
+        return torch.tensor(0.0, device=audience_p.device)
+    a = audience_p[mask]
+    t = trend_scores[mask]
+    a_center = a - a.mean()
+    t_center = t - t.mean()
+    a_std = a_center.std(unbiased=False)
+    t_std = t_center.std(unbiased=False)
+    if a_std < 1e-8 or t_std < 1e-8:
+        return torch.tensor(0.0, device=audience_p.device)
+    denom = (a_std * t_std) + 1e-12
+    corr = (a_center * t_center).mean() / denom
+    return 1.0 - corr
+
+
 def loss_reg(
     audience_p: "torch.Tensor",
     soft_ranks: "torch.Tensor",
@@ -211,6 +235,31 @@ def loss_diversity_batched(
     return pair_penalty[:, upper_mask].mean(dim=1)
 
 
+def loss_trend_batched(
+    audience_p: "torch.Tensor", trend_scores: Optional["torch.Tensor"]
+) -> "torch.Tensor":
+    if trend_scores is None or trend_scores.numel() == 0:
+        return torch.zeros(audience_p.shape[0], device=audience_p.device)
+    if trend_scores.numel() != audience_p.shape[1]:
+        return torch.zeros(audience_p.shape[0], device=audience_p.device)
+    mask = torch.isfinite(trend_scores)
+    if mask.sum() < 2:
+        return torch.zeros(audience_p.shape[0], device=audience_p.device)
+    t = trend_scores[mask]
+    t_center = t - t.mean()
+    t_std = t_center.std(unbiased=False)
+    if t_std < 1e-8:
+        return torch.zeros(audience_p.shape[0], device=audience_p.device)
+    a = audience_p[:, mask]
+    a_center = a - a.mean(dim=1, keepdim=True)
+    a_std = a_center.std(dim=1, unbiased=False)
+    denom = (a_std * t_std) + 1e-12
+    corr = (a_center * t_center).mean(dim=1) / denom
+    loss = 1.0 - corr
+    loss = torch.where(a_std < 1e-8, torch.zeros_like(loss), loss)
+    return loss
+
+
 def _build_prev_percent_tensor(
     participant_names: List[str],
     prev_percent_map: Dict[str, float],
@@ -225,12 +274,33 @@ def _build_prev_percent_tensor(
     return prev_percent_tensor
 
 
+def _build_trend_tensor(
+    trend_scores: Optional[List[float]],
+    device: "torch.device",
+) -> Optional["torch.Tensor"]:
+    if trend_scores is None:
+        return None
+    values: List[float] = []
+    for val in trend_scores:
+        try:
+            if val is None:
+                values.append(float("nan"))
+            else:
+                values.append(float(val))
+        except Exception:
+            values.append(float("nan"))
+    if not values:
+        return torch.empty((0,), dtype=torch.float32, device=device)
+    return torch.tensor(values, dtype=torch.float32, device=device)
+
+
 def _compute_total_loss(
     audience_p: "torch.Tensor",
     judge_p: "torch.Tensor",
     safe_mask: "torch.Tensor",
     elim_mask: "torch.Tensor",
     prev_percent_tensor: "torch.Tensor",
+    trend_tensor: Optional["torch.Tensor"],
     config: PercentLossConfig,
 ) -> "torch.Tensor":
     ranks = soft_rank(audience_p, tau=config.rank_tau)
@@ -248,12 +318,14 @@ def _compute_total_loss(
         longtail_shift=config.longtail_shift,
     )
     l_div = loss_diversity(audience_p, sigma=config.diversity_sigma)
+    l_trend = loss_trend(audience_p, trend_tensor)
     return (
         config.alpha_constraint * l_constraint
         + config.beta_smooth * l_smooth
         + config.gamma_corr * l_corr
         + config.delta_reg * l_reg
         + config.epsilon_diversity * l_div
+        + config.zeta_trend * l_trend
     )
 
 
@@ -263,6 +335,7 @@ def _compute_total_loss_batched(
     safe_mask: "torch.Tensor",
     elim_mask: "torch.Tensor",
     prev_percent_tensor: "torch.Tensor",
+    trend_tensor: Optional["torch.Tensor"],
     config: PercentLossConfig,
     upper_mask: "torch.Tensor",
 ) -> "torch.Tensor":
@@ -308,6 +381,7 @@ def _compute_total_loss_batched(
     l_reg = (audience_p * (audience_p.add(eps).log() - target.add(eps).log())).sum(dim=1)
 
     l_div = loss_diversity_batched(audience_p, sigma=config.diversity_sigma, upper_mask=upper_mask)
+    l_trend = loss_trend_batched(audience_p, trend_tensor)
 
     return (
         config.alpha_constraint * l_constraint
@@ -315,6 +389,7 @@ def _compute_total_loss_batched(
         + config.gamma_corr * l_corr
         + config.delta_reg * l_reg
         + config.epsilon_diversity * l_div
+        + config.zeta_trend * l_trend
     )
 
 
@@ -324,6 +399,7 @@ def optimize_audience_percent(
     safe_mask: List[bool],
     prev_percent_map: Dict[str, float],
     participant_names: List[str],
+    trend_scores: Optional[List[float]] = None,
     config: PercentLossConfig,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
     """
@@ -338,6 +414,7 @@ def optimize_audience_percent(
     judge_p = torch.tensor(judge_percents, dtype=torch.float32, device=device)
     elim_mask = torch.tensor(eliminated_mask, dtype=torch.bool, device=device)
     safe_mask = torch.tensor(safe_mask, dtype=torch.bool, device=device)
+    trend_tensor = _build_trend_tensor(trend_scores, device=device)
 
     # Init logits with judge percents for a reasonable starting point.
     init = np.log(np.array(judge_percents, dtype=np.float64) + 1e-6)
@@ -374,6 +451,7 @@ def optimize_audience_percent(
             longtail_shift=config.longtail_shift,
         )
         l_div = loss_diversity(aud, sigma=config.diversity_sigma)
+        l_trend = loss_trend(aud, trend_tensor)
 
         total = (
             config.alpha_constraint * l_constraint
@@ -381,6 +459,7 @@ def optimize_audience_percent(
             + config.gamma_corr * l_corr
             + config.delta_reg * l_reg
             + config.epsilon_diversity * l_div
+            + config.zeta_trend * l_trend
         )
 
         opt.zero_grad(set_to_none=True)
@@ -399,6 +478,7 @@ def optimize_audience_percent(
                     corr=f"{l_corr.item():.4f}",
                     reg=f"{l_reg.item():.4f}",
                     div=f"{l_div.item():.4f}",
+                    trend=f"{l_trend.item():.4f}",
                 )
 
     with torch.no_grad():
@@ -438,6 +518,7 @@ def optimize_audience_percent(
             longtail_shift=config.longtail_shift,
         ).item()
         l_div = loss_diversity(aud_t, sigma=config.diversity_sigma).item()
+        l_trend = loss_trend(aud_t, trend_tensor).item()
 
     loss_breakdown = {
         "constraint": l_constraint,
@@ -445,12 +526,14 @@ def optimize_audience_percent(
         "corr": l_corr,
         "reg": l_reg,
         "diversity": l_div,
+        "trend": l_trend,
         "total": (
             config.alpha_constraint * l_constraint
             + config.beta_smooth * l_smooth
             + config.gamma_corr * l_corr
             + config.delta_reg * l_reg
             + config.epsilon_diversity * l_div
+            + config.zeta_trend * l_trend
         ),
     }
 
@@ -463,6 +546,7 @@ def optimize_audience_percent_ranges_loss_bounded(
     safe_mask: List[bool],
     prev_percent_map: Dict[str, float],
     participant_names: List[str],
+    trend_scores: Optional[List[float]] = None,
     config: PercentLossConfig,
     base_audience_percents: np.ndarray,
     min_total_loss: float,
@@ -494,6 +578,7 @@ def optimize_audience_percent_ranges_loss_bounded(
         prev_percent_map=prev_percent_map,
         device=device,
     )
+    trend_tensor = _build_trend_tensor(trend_scores, device=device)
 
     base_audience = np.clip(np.asarray(base_audience_percents, dtype=np.float64), 1e-8, 1.0)
     base_audience = base_audience / base_audience.sum()
@@ -522,7 +607,13 @@ def optimize_audience_percent_ranges_loss_bounded(
             for _ in range(steps):
                 aud = torch.softmax(logits / config.temperature, dim=0)
                 total_loss = _compute_total_loss(
-                    aud, judge_p, safe_mask_t, elim_mask, prev_percent_tensor, config
+                    aud,
+                    judge_p,
+                    safe_mask_t,
+                    elim_mask,
+                    prev_percent_tensor,
+                    trend_tensor,
+                    config,
                 )
                 violation = torch.relu(total_loss - loss_threshold)
                 if direction == "min":
@@ -537,7 +628,13 @@ def optimize_audience_percent_ranges_loss_bounded(
             with torch.no_grad():
                 aud = torch.softmax(logits / config.temperature, dim=0)
                 total_loss = _compute_total_loss(
-                    aud, judge_p, safe_mask_t, elim_mask, prev_percent_tensor, config
+                    aud,
+                    judge_p,
+                    safe_mask_t,
+                    elim_mask,
+                    prev_percent_tensor,
+                    trend_tensor,
+                    config,
                 )
                 violation = max(0.0, total_loss.item() - loss_threshold)
                 candidate = aud[target_idx].item()
@@ -574,7 +671,14 @@ def optimize_audience_percent_ranges_loss_bounded(
             for _ in range(steps):
                 aud = torch.softmax(logits / config.temperature, dim=1)
                 total_loss = _compute_total_loss_batched(
-                    aud, judge_p, safe_mask_t, elim_mask, prev_percent_tensor, config, upper_mask
+                    aud,
+                    judge_p,
+                    safe_mask_t,
+                    elim_mask,
+                    prev_percent_tensor,
+                    trend_tensor,
+                    config,
+                    upper_mask,
                 )
                 violation = torch.relu(total_loss - loss_threshold)
                 target_vals = aud[targets, targets]
@@ -590,7 +694,14 @@ def optimize_audience_percent_ranges_loss_bounded(
             with torch.no_grad():
                 aud = torch.softmax(logits / config.temperature, dim=1)
                 total_loss = _compute_total_loss_batched(
-                    aud, judge_p, safe_mask_t, elim_mask, prev_percent_tensor, config, upper_mask
+                    aud,
+                    judge_p,
+                    safe_mask_t,
+                    elim_mask,
+                    prev_percent_tensor,
+                    trend_tensor,
+                    config,
+                    upper_mask,
                 )
                 violation = torch.clamp(total_loss - loss_threshold, min=0.0)
                 candidate = aud[targets, targets]
