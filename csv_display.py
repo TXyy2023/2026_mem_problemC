@@ -14,7 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 RESULTS_FILE = BASE_DIR / 'MCM_Problem_C_Results.csv'
 MC_RESULTS_FILE = BASE_DIR / 'MCM_Problem_C_Results_20260201_1748.csv'
 DIFF_SUMMARY_FILE = BASE_DIR / 'diff_summary.csv'
-RANK_PERCENT_DIFF_SUMMARY_FILE = BASE_DIR / 'rank_percent_diff_summary.csv'
+RANK_PERCENT_DIFF_SUMMARY_FILE = BASE_DIR / 'MCM_Problem_C_Results_20260201_1748_uncertainty.csv'
 ATTRACT_OUTPUT_DIR = BASE_DIR / 'Attract' / 'output'
 # Original data might be useful, but let's stick to Results for now as requested for "calculated data"
 # We can load original for extra context if needed, but the user focused on the output tables.
