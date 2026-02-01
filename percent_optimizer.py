@@ -547,7 +547,6 @@ def optimize_audience_percent_ranges_loss_bounded(
     prev_percent_map: Dict[str, float],
     participant_names: List[str],
     config: PercentLossConfig,
-    trend_scores: Optional[List[float]] = None,
     base_audience_percents: np.ndarray,
     min_total_loss: float,
     loss_slack_ratio: float = None,
@@ -557,6 +556,7 @@ def optimize_audience_percent_ranges_loss_bounded(
     penalty_base: float = 50.0,
     penalty_growth: float = 10.0,
     attempts: int = 3,
+    trend_scores: Optional[List[float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Compute min/max audience percents for each participant while enforcing
