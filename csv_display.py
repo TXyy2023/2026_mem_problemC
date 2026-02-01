@@ -13,7 +13,7 @@ st.set_page_config(layout="wide", page_title="MCM Results Viewer")
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_FILE = BASE_DIR / 'MCM_Problem_C_Results.csv'
 MC_RESULTS_FILE = BASE_DIR / 'MCM_Problem_C_Results_20260201_1748.csv'
-DIFF_SUMMARY_FILE = BASE_DIR / 'diff_summary.csv'
+DIFF_SUMMARY_FILE = BASE_DIR / 'rank_percent_diff_summary.csv'
 RANK_PERCENT_DIFF_SUMMARY_FILE = BASE_DIR / 'MCM_Problem_C_Results_20260201_1748_uncertainty.csv'
 ATTRACT_OUTPUT_DIR = BASE_DIR / 'Attract' / 'output'
 # Original data might be useful, but let's stick to Results for now as requested for "calculated data"
@@ -386,7 +386,17 @@ def _render_variable_guide(
         "Diff_Score_Normalized": "标准化后的差异分数（越大代表差异越明显）",
     }
 
-    rank_percent_diff_desc = diff_desc.copy()
+    rank_percent_diff_desc = {
+        "CelebrityName": "选手姓名",
+        "Season": "赛季编号",
+        "Week": "周次",
+        "RuleType": "规则类型（Rank/Percent）",
+        "Possible_Audience_Vote_Range": "观众投票可能范围（排名区间或百分比区间）",
+        "Uncertainty_Range_Min": "不确定性区间下界",
+        "Uncertainty_Range_Max": "不确定性区间上界",
+        "Uncertainty_Range_Width": "不确定性区间宽度（Max-Min）",
+        "Uncertainty_Index": "不确定性指数（归一化宽度）",
+    }
 
     attract_common_desc = {
         "RuleType": "规则类型（Rank/Percent）",
@@ -422,7 +432,7 @@ def _render_variable_guide(
             rows.append({"字段": col, "说明": desc})
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-    tabs = st.tabs(["Calculated Results", "Monte Carlo", "Original Data", "Diff Summary", "Rank vs Percent Summary", "Attract Tables"])
+    tabs = st.tabs(["Calculated Results", "Monte Carlo", "Original Data", "Diff Summary", "Uncertainty Summary", "Attract Tables"])
     with tabs[0]:
         render_table(results_df, results_desc, "Calculated Results 字段")
     with tabs[1]:
@@ -433,8 +443,8 @@ def _render_variable_guide(
         diff_df = extra_tables.get("diff_summary", pd.DataFrame())
         render_table(diff_df, diff_desc, "diff_summary 字段")
     with tabs[4]:
-        rp_df = extra_tables.get("rank_percent_diff_summary", pd.DataFrame())
-        render_table(rp_df, rank_percent_diff_desc, "rank_percent_diff_summary 字段")
+        rp_df = extra_tables.get("MCM_Problem_C_Results_20260201_1748_uncertainty", pd.DataFrame())
+        render_table(rp_df, rank_percent_diff_desc, "uncertainty 字段")
     with tabs[5]:
         attract_tables = {
             k: v for k, v in extra_tables.items() if k.startswith("Attract/")
@@ -824,7 +834,15 @@ def main():
             return
 
         table_names = sorted(all_tables.keys())
-        default_tables = [name for name in table_names if name in {"diff_summary", "rank_percent_diff_summary"}]
+        default_tables = [
+            name
+            for name in table_names
+            if name
+            in {
+                "rank_percent_diff_summary",
+                "MCM_Problem_C_Results_20260201_1748_uncertainty",
+            }
+        ]
         if not default_tables:
             default_tables = [table_names[0]]
 
@@ -847,9 +865,9 @@ def main():
             st.info("Select at least one table to plot.")
 
         st.subheader("Quick Charts (Paper-ready presets)")
-        if "diff_summary" in all_tables:
-            st.markdown("**diff_summary**")
-            diff_df = all_tables["diff_summary"].copy()
+        if "rank_percent_diff_summary" in all_tables:
+            st.markdown("**rank_percent_diff_summary**")
+            diff_df = all_tables["rank_percent_diff_summary"].copy()
             diff_df = _coerce_numeric(diff_df, ["Week", "Season", "Diff_Score_Normalized"])
             if {"Week", "Diff_Score_Normalized"}.issubset(diff_df.columns):
                 fig = px.line(
@@ -862,17 +880,17 @@ def main():
                 _apply_paper_style(fig)
                 st.plotly_chart(fig, use_container_width=True, config=_chart_config())
 
-        if "rank_percent_diff_summary" in all_tables:
-            st.markdown("**rank_percent_diff_summary**")
-            rp_df = all_tables["rank_percent_diff_summary"].copy()
-            rp_df = _coerce_numeric(rp_df, ["Week", "Season", "Diff_Score_Normalized"])
-            if {"Week", "Diff_Score_Normalized"}.issubset(rp_df.columns):
+        if "MCM_Problem_C_Results_20260201_1748_uncertainty" in all_tables:
+            st.markdown("**uncertainty**")
+            rp_df = all_tables["MCM_Problem_C_Results_20260201_1748_uncertainty"].copy()
+            rp_df = _coerce_numeric(rp_df, ["Week", "Season", "Uncertainty_Index"])
+            if {"Week", "Uncertainty_Index"}.issubset(rp_df.columns):
                 fig = px.line(
-                    rp_df.groupby("Week", as_index=False)["Diff_Score_Normalized"].mean(),
+                    rp_df.groupby("Week", as_index=False)["Uncertainty_Index"].mean(),
                     x="Week",
-                    y="Diff_Score_Normalized",
+                    y="Uncertainty_Index",
                     markers=True,
-                    title="Avg Diff_Score_Normalized by Week (Rank vs Percent)",
+                    title="Avg Uncertainty_Index by Week",
                 )
                 _apply_paper_style(fig)
                 st.plotly_chart(fig, use_container_width=True, config=_chart_config())
