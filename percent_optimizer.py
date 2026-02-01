@@ -399,8 +399,8 @@ def optimize_audience_percent(
     safe_mask: List[bool],
     prev_percent_map: Dict[str, float],
     participant_names: List[str],
-    trend_scores: Optional[List[float]] = None,
     config: PercentLossConfig,
+    trend_scores: Optional[List[float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
     """
     Optimize audience percentages for a single week using backprop.
@@ -546,8 +546,8 @@ def optimize_audience_percent_ranges_loss_bounded(
     safe_mask: List[bool],
     prev_percent_map: Dict[str, float],
     participant_names: List[str],
-    trend_scores: Optional[List[float]] = None,
     config: PercentLossConfig,
+    trend_scores: Optional[List[float]] = None,
     base_audience_percents: np.ndarray,
     min_total_loss: float,
     loss_slack_ratio: float = None,
