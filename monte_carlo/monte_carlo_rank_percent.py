@@ -2,9 +2,10 @@ import argparse
 import os
 
 import pandas as pd
+import numpy as np
 
 DEFAULT_MC_INPUT = 'MCM_Problem_C_MonteCarlo_Results.csv'
-DEFAULT_RESULT_DATA = 'MCM_Problem_C_Results_20260201_1348.csv'
+DEFAULT_RESULT_DATA = 'MCM_Problem_C_Results_20260201_1748.csv'
 
 
 def rank_to_percent(rank, n):
@@ -83,7 +84,26 @@ def build_normalized_percent(df):
 
 def update_result_data(result_df, mc_df):
     mc_pred = build_normalized_percent(mc_df)
-    mc_pred = mc_pred[['Season', 'Week', 'CelebrityName', 'Percent_Predict', 'Rank_predict']]
+    keep_cols = ['Season', 'Week', 'CelebrityName', 'Percent_Predict', 'Rank_predict']
+    for col in ['CI_Lower', 'CI_Upper']:
+        if col in mc_pred.columns:
+            keep_cols.append(col)
+    mc_pred = mc_pred[keep_cols]
+    if 'CI_Lower' in mc_pred.columns or 'CI_Upper' in mc_pred.columns:
+        mc_pred = mc_pred.rename(
+            columns={
+                'CI_Lower': 'CI_Lower_mc',
+                'CI_Upper': 'CI_Upper_mc',
+            }
+        )
+
+    participants = (
+        mc_df.groupby(['Season', 'Week'])['CelebrityName']
+        .nunique()
+        .rename('Participants_mc')
+        .reset_index()
+    )
+    mc_pred = mc_pred.merge(participants, on=['Season', 'Week'], how='left')
 
     merged = result_df.merge(
         mc_pred,
@@ -102,6 +122,38 @@ def update_result_data(result_df, mc_df):
 
     if 'Predicted_Audience_Rank' in merged.columns and 'Rank_predict_mc' in merged.columns:
         merged.loc[rank_mask, 'Predicted_Audience_Rank'] = merged.loc[rank_mask, 'Rank_predict_mc']
+
+    if (
+        'Possible_Audience_Vote_Range' in merged.columns
+        and 'CI_Lower_mc' in merged.columns
+        and 'CI_Upper_mc' in merged.columns
+    ):
+        def _format_ci_range(row):
+            ci_low = row.get('CI_Lower_mc')
+            ci_high = row.get('CI_Upper_mc')
+            if pd.isna(ci_low) or pd.isna(ci_high):
+                return row.get('Possible_Audience_Vote_Range')
+
+            try:
+                low = int(np.floor(ci_low))
+                high = int(np.ceil(ci_high))
+            except Exception:
+                return row.get('Possible_Audience_Vote_Range')
+
+            n = row.get('Participants_mc')
+            if pd.notna(n):
+                n_int = int(n)
+                low = max(1, min(low, n_int))
+                high = max(1, min(high, n_int))
+
+            if low > high:
+                low, high = high, low
+
+            return f"{low}-{high}"
+
+        merged.loc[rank_mask, 'Possible_Audience_Vote_Range'] = (
+            merged.loc[rank_mask].apply(_format_ci_range, axis=1)
+        )
 
     # Ensure per-week Predicted_Audience_Percent sums to exactly 100 after rounding for Rank rows
     if 'Predicted_Audience_Percent' in merged.columns and 'RuleType' in merged.columns:

@@ -19,7 +19,7 @@ L_total = α * L_constraint + β * L_smooth + γ * L_corr + δ * L_reg + ε * L_
 
 ## 1. 约束损失 L_constraint
 
-目的：保证“安全组”的总分不低于“淘汰组”，否则惩罚。
+目的：保证“安全组”成员的总分不低于“淘汰组”成员，否则惩罚。
 
 定义：
 
@@ -27,11 +27,11 @@ L_total = α * L_constraint + β * L_smooth + γ * L_corr + δ * L_reg + ε * L_
 - `safe_mask` 为安全组布尔掩码，`elim_mask` 为淘汰组布尔掩码
 - margin 为 `constraint_margin`
 
-计算：
+计算（安全组与淘汰组做两两比较）：
 
 ```
-violation = margin - (total_safe - total_elim)
-L_constraint = mean( relu(violation)^2 )
+violation_{i,j} = margin - (total_safe_i - total_elim_j)
+L_constraint = mean( relu(violation_{i,j})^2 ),  i ∈ safe, j ∈ elim
 ```
 
 若安全组或淘汰组为空，返回 0。
@@ -84,7 +84,7 @@ rank_i = 1 + sum_{j!=i} sigmoid((v_j - v_i) / tau)
 - 正态分布型（`reg_type = "normal"`）：
 ```
 mu = (n + 1) / 2
-sigma = n * normal_sigma_factor
+sigma = max(1e-3, n * normal_sigma_factor)
 target_i = exp(-0.5 * ((rank_i - mu) / sigma)^2)
 ```
 
@@ -116,17 +116,9 @@ L_diversity = mean( exp(-|a_i - a_j| / sigma) ),  i < j
 
 Where:
 - `a_i` are the audience percentages for the week
-- `sigma = diversity_sigma`
+- `sigma = diversity_sigma`（实现中使用 `max(sigma, 1e-6)` 防止数值问题）
 
-Updated total loss:
-```
-L_total = alpha_constraint * L_constraint
-        + beta_smooth * L_smooth
-        + gamma_corr * L_corr
-        + delta_reg * L_reg
-        + epsilon_diversity * L_diversity
-        + zeta_trend * L_trend
-```
+当参赛人数 < 2 时，返回 0。
 
 ## 6. Trend loss L_trend (search interest)
 
@@ -136,6 +128,7 @@ L_total = alpha_constraint * L_constraint
 
 - `trend_scores` 为该周参赛选手的搜索热度（来自 `search_trend.csv`）
 - 对缺失值用 NaN 占位并忽略
+- 若 `trend_scores` 为空或无有效值，返回 0
 
 计算（相关系数损失）：
 ```
@@ -143,4 +136,4 @@ corr = mean((a - mean(a)) * (t - mean(t))) / (std(a) * std(t) + 1e-12)
 L_trend = 1 - corr
 ```
 
-其中 `a = audience_p`，`t = trend_scores`；当有效样本数 < 2 或标准差过小，返回 0。
+其中 `a = audience_p`，`t = trend_scores`；当有效样本数 < 2、长度不一致、或标准差过小（< 1e-8）时，返回 0。

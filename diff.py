@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 
 
-DEFAULT_INPUT = "MCM_Problem_C_Results_20260201_1348.csv"
+DEFAULT_INPUT = "MCM_Problem_C_Results_20260201_1748.csv"
 DEFAULT_OUTPUT = "rank_percent_diff_summary.csv"
 
 
